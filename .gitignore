@@ -6,7 +6,9 @@
 !ps2_classics_gui_mod.py
 !start.bat
 !build.bat
-!LICENSE
+!preview.jpg
+!app.ico
+!app.png
 
 # Generated output and caches.
 _build/
