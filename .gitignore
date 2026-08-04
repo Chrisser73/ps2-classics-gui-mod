@@ -8,10 +8,6 @@
 !build.bat
 !LICENSE
 
-# Local application assets.
-app.ico
-app.png
-
 # Generated output and caches.
 _build/
 build/
