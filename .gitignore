@@ -1,0 +1,58 @@
+# Track only files authored for this mod.
+*
+
+!.gitignore
+!README.md
+!ps2_classics_gui_mod.py
+!start.bat
+!build.bat
+!LICENSE
+
+# Local application assets.
+app.ico
+app.png
+
+# Generated output and caches.
+_build/
+build/
+dist/
+_pyinstaller_work/
+_pyinstaller_spec/
+__pycache__/
+*.pyc
+*.spec
+
+# Original GUI distribution and external tools.
+*.exe
+*.dll
+*.ocx
+PS2U10000/
+PS2Covers/
+CONFIGS/
+scetool/
+rifgen_for_ps3xploit/
+
+# Game, package and license data.
+*.iso
+*.bin
+*.enc
+*.edat
+*.pkg
+*.rap
+*.rif
+*.vmc
+*.vme
+*.at3
+*.key
+exdata/
+EXDATA/
+
+# Package assets and local settings.
+ICON0.PNG
+PIC0.PNG
+PIC1.PNG
+SND0.AT3
+PARAM.SFO
+CONFIG
+package.conf
+ps2_pkg_builder_settings.json
