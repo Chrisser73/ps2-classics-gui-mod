@@ -1,15 +1,26 @@
+import difflib
 import hashlib
+import json
 import os
+import queue
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import tkinter as tk
 import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
-from pathlib import Path
+import zipfile
+from html.parser import HTMLParser
+from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:
@@ -22,11 +33,153 @@ except ImportError:
     ImageTk = None
 
 
+class _CompatibilityTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self._in_row = False
+        self._in_cell = False
+        self._cells = []
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag == "tr":
+            self._in_row = True
+            self._cells = []
+            return
+
+        if self._in_row and tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell = {
+                "parts": [],
+                "class": attrs.get("class", ""),
+                "meta": [],
+            }
+            return
+
+        if self._in_cell and self._cell is not None:
+            title = attrs.get("title")
+            if title:
+                self._cell["meta"].append(title)
+            if tag in {"br", "div", "li", "p"}:
+                self._cell["parts"].append(" | ")
+
+    def handle_endtag(self, tag):
+        if tag in {"td", "th"} and self._in_cell:
+            text = "".join(self._cell["parts"])
+            text = re.sub(r"\s+", " ", text).strip(" |")
+            self._cell["text"] = text
+            self._cells.append(self._cell)
+            self._cell = None
+            self._in_cell = False
+            return
+
+        if tag == "tr" and self._in_row:
+            if self._cells:
+                self.rows.append(self._cells)
+            self._cells = []
+            self._in_row = False
+
+    def handle_data(self, data):
+        if self._in_cell and self._cell is not None:
+            self._cell["parts"].append(data)
+
+
+class _DataCenterListParser(HTMLParser):
+    SERIAL_RE = re.compile(
+        r"\b(?:SLUS|SLES|SCUS|SCES|SLPM|SLPS|SCPS|SCAJ|SCKA|"
+        r"SCED|TCES|TCUS|PBPX|PAPX|PCPX|SCCS)-[0-9]{5}\b",
+        re.IGNORECASE,
+    )
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.entries = {}
+        self._in_row = False
+        self._in_cell = False
+        self._cells = []
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._in_row = True
+            self._cells = []
+        elif self._in_row and tag in {"td", "th"}:
+            self._in_cell = True
+            self._parts = []
+        elif self._in_cell and tag in {"br", "div", "p"}:
+            self._parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in {"td", "th"} and self._in_cell:
+            value = re.sub(r"\s+", " ", "".join(self._parts)).strip()
+            self._cells.append(value)
+            self._parts = []
+            self._in_cell = False
+            return
+
+        if tag == "tr" and self._in_row:
+            self._store_row()
+            self._cells = []
+            self._in_row = False
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._parts.append(data)
+
+    def _store_row(self):
+        for index, cell in enumerate(self._cells):
+            match = self.SERIAL_RE.search(cell)
+            if not match:
+                continue
+
+            serial = match.group(0).upper()
+            title = ""
+            for candidate in self._cells[index + 1:]:
+                candidate = candidate.strip()
+                if candidate and not self.SERIAL_RE.fullmatch(candidate):
+                    title = candidate
+                    break
+
+            if title:
+                self.entries.setdefault(serial, title)
+            return
+
+
 class PS2ClassicsGUIMod:
-    APP_VERSION = "0.9.8"
+    APP_VERSION = "0.10.4"
     APP_NAME = "PS2 Classics GUI - Mod by Chrisser"
     APP_ID = "Chrisser.PS2ClassicsGUIMod"
     EMPTY_PACKAGE_KLICENSEE = "0" * 32
+
+    CONFIG_ARCHIVE_URLS = (
+        "https://codeload.github.com/aldostools/webMAN-MOD/zip/refs/heads/master",
+        "https://github.com/aldostools/webMAN-MOD/archive/refs/heads/master.zip",
+    )
+    CONFIG_ARCHIVE_PATH = "_Projects_/updater/PS2CONFIG/USRDIR/CONFIG/"
+    DATACENTER_URLS = {
+        "PAL-EU": "https://psxdatacenter.com/psx2/plist2.html",
+        "NTSC-U": "https://psxdatacenter.com/psx2/ulist2.html",
+        "NTSC-J/Asia": "https://psxdatacenter.com/psx2/jlist2.html",
+    }
+
+    COMPATIBILITY_CACHE_FILE = "comp_cache.db"
+    COMPATIBILITY_LOCAL_HTML_NAMES = (
+        "PS2 Classics Emulator Compatibility List - PS3 Developer wiki.html",
+        "PS2_Classics_Emulator_Compatibility_List.html",
+    )
+
+    COMPATIBILITY_COLORS = {
+        "PS2 Classic": ("#0088ee", "#ffffff"),
+        "Playable": ("#99dd99", "#0055bb"),
+        "Minor Issues": ("#eeee88", "#0055bb"),
+        "Major Issues": ("#ee9933", "#772222"),
+        "Unplayable": ("#ee4444", "#772222"),
+        "Available": ("#bbbbbb", "#555555"),
+        "Not Available": ("#dddddd", "#888888"),
+    }
 
     # Shared UI theme
     COLOR_BG = "#1e1e1e"
@@ -107,6 +260,19 @@ class PS2ClassicsGUIMod:
         self.disc_id_cache_path = None
         self.disc_id_cache_value = None
         self.auto_config_path = ""
+        self.auto_image_type_path = None
+        self.config_update_running = False
+        self.config_update_queue = queue.Queue()
+        self.compatibility_queue = queue.Queue()
+        self.compatibility_after_id = None
+        self.compatibility_request_id = 0
+        self.compatibility_notes_expanded = False
+        self._local_compatibility_rows = None
+        self.compat_cache_running = False
+        self.compat_cache_queue = queue.Queue()
+        self.compatibility_source_override = None
+        self._source_refresh_after_id = None
+        self._last_source_refresh_path = None
 
         # Build source
         self.input_mode = tk.StringVar(value="raw")
@@ -117,6 +283,11 @@ class PS2ClassicsGUIMod:
         self.create_individual_edat = tk.BooleanVar(value=False)
         self.keep_encrypted_artifacts = tk.BooleanVar(value=False)
         self.status_text = tk.StringVar(value="Ready")
+        self.config_update_status = tk.StringVar(value="")
+        self.compatibility_status = tk.StringVar(value="Not checked")
+        self.compatibility_match = tk.StringVar(value="")
+        self.compatibility_notes = tk.StringVar(value="")
+        self.image_type_detection = tk.StringVar(value="")
 
         # Optional package assets
         self.icon0_path = tk.StringVar()
@@ -156,6 +327,9 @@ class PS2ClassicsGUIMod:
         self.load_existing_assets()
         self.load_existing_tools()
         self.root.after(100, self.update_live_preview)
+        self.root.after(150, self.poll_config_update_queue)
+        self.root.after(150, self.poll_compatibility_queue)
+        self.root.after(150, self.poll_compat_cache_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # -------------------------------------------------------
@@ -748,6 +922,95 @@ class PS2ClassicsGUIMod:
             self.browse_iso,
             required=True,
         )
+
+        compatibility_frame = tk.Frame(self.form_frame, bg=self.COLOR_BG)
+        compatibility_frame.pack(
+            fill="x",
+            padx=(0, 8),
+            pady=(5, 0),
+        )
+
+        tk.Label(
+            compatibility_frame,
+            text="Compatibility",
+            fg=self.COLOR_TEXT,
+            bg=self.COLOR_BG,
+            font=self.FONT_BOLD,
+        ).pack(side="left")
+
+        self.compatibility_status_label = tk.Label(
+            compatibility_frame,
+            textvariable=self.compatibility_status,
+            fg=self.COLOR_TEXT_MUTED,
+            bg=self.COLOR_PANEL,
+            font=self.FONT_SMALL,
+            padx=8,
+            pady=2,
+        )
+        self.compatibility_status_label.pack(side="left", padx=(8, 0))
+
+        self.compat_cache_button = tk.Button(
+            compatibility_frame,
+            text="Get cache",
+            command=self.refresh_compatibility_cache,
+            width=9,
+            padx=2,
+            pady=0,
+            font=self.FONT_SMALL,
+        )
+        self.compat_cache_button.pack(side="right")
+        self.update_compat_cache_button()
+
+        self.compatibility_match_label = tk.Label(
+            self.form_frame,
+            textvariable=self.compatibility_match,
+            fg=self.COLOR_DESCRIPTION,
+            bg=self.COLOR_BG,
+            justify="left",
+            anchor="w",
+            wraplength=540,
+            font=self.FONT_SMALL,
+        )
+        self.compatibility_match_label.pack(
+            fill="x",
+            padx=(0, 8),
+            pady=(2, 0),
+        )
+
+        self.compatibility_notes_button = tk.Button(
+            self.form_frame,
+            text="Notes",
+            command=self.toggle_compatibility_notes,
+            anchor="w",
+            relief="flat",
+            bd=0,
+            state=tk.DISABLED,
+            bg=self.COLOR_BG,
+            activebackground=self.COLOR_BG,
+            fg=self.COLOR_DESCRIPTION,
+            activeforeground=self.COLOR_TEXT_SOFT,
+            disabledforeground="#666666",
+            font=self.FONT_SMALL,
+            padx=0,
+            pady=0,
+        )
+        self.compatibility_notes_button.pack(
+            fill="x",
+            padx=(0, 8),
+            pady=(1, 0),
+        )
+
+        self.compatibility_notes_label = tk.Label(
+            self.form_frame,
+            textvariable=self.compatibility_notes,
+            fg=self.COLOR_DESCRIPTION,
+            bg=self.COLOR_BG,
+            justify="left",
+            anchor="w",
+            wraplength=540,
+            font=self.FONT_SMALL,
+        )
+
         self.add_file_row(
             "ISO.BIN.EDAT sidecar",
             (
@@ -791,6 +1054,65 @@ class PS2ClassicsGUIMod:
             self.param_hip_path,
             self.browse_param_hip,
         )
+
+        config_actions = tk.Frame(self.form_frame, bg=self.COLOR_BG)
+        config_actions.pack(
+            fill="x",
+            padx=(0, 8),
+            pady=(4, 0),
+        )
+
+        self.config_update_slot = tk.Frame(
+            config_actions,
+            bg=self.COLOR_BG,
+            width=92,
+            height=24,
+        )
+        self.config_update_slot.pack(side="left")
+        self.config_update_slot.pack_propagate(False)
+
+        self.update_configs_button = tk.Button(
+            self.config_update_slot,
+            text="Update configs",
+            command=self.update_configs,
+            padx=4,
+            pady=0,
+            font=self.FONT_SMALL,
+        )
+        self.update_configs_button.pack(fill="both", expand=True)
+
+        self.config_update_progress_frame = tk.Frame(
+            self.config_update_slot,
+            bg=self.COLOR_BG,
+        )
+        self.config_update_progress = ttk.Progressbar(
+            self.config_update_progress_frame,
+            mode="determinate",
+            maximum=100,
+        )
+        self.config_update_progress.pack(fill="both", expand=True)
+
+        self.rescan_configs_button = tk.Button(
+            config_actions,
+            text="Re-scan configs",
+            command=self.rescan_configs,
+            padx=4,
+            pady=2,
+            font=self.FONT_SMALL,
+        )
+        self.rescan_configs_button.pack(side="left", padx=(5, 0))
+
+        tk.Label(
+            self.form_frame,
+            textvariable=self.config_update_status,
+            fg=self.COLOR_DESCRIPTION,
+            bg=self.COLOR_BG,
+            justify="left",
+            anchor="w",
+            wraplength=540,
+            font=self.FONT_SMALL,
+        ).pack(fill="x", padx=(0, 8), pady=(2, 0))
+
         self.add_file_row(
             "make_npdata.exe (auto-detected)",
             (
@@ -904,6 +1226,17 @@ class PS2ClassicsGUIMod:
             )
             button.pack(anchor="w", padx=7, pady=2)
             self.image_type_buttons.append(button)
+
+        tk.Label(
+            image_group,
+            textvariable=self.image_type_detection,
+            fg=self.COLOR_DESCRIPTION_DARK,
+            bg=self.COLOR_BG,
+            justify="left",
+            anchor="w",
+            wraplength=245,
+            font=self.FONT_SMALL,
+        ).pack(fill="x", padx=7, pady=(2, 5))
 
         target_group = tk.LabelFrame(
             option_grid,
@@ -1144,6 +1477,11 @@ class PS2ClassicsGUIMod:
         ):
             variable.trace_add("write", self.schedule_preview)
 
+        self.game_title.trace_add(
+            "write",
+            lambda *_args: self.schedule_compatibility_check(),
+        )
+
         for variable in (
             self.iso_path,
             self.edat_source_path,
@@ -1179,6 +1517,14 @@ class PS2ClassicsGUIMod:
         self.iso_path.trace_add(
             "write",
             lambda *_args: self.update_encrypt_option_state(),
+        )
+        self.iso_path.trace_add(
+            "write",
+            lambda *_args: self.schedule_compatibility_check(),
+        )
+        self.iso_path.trace_add(
+            "write",
+            lambda *_args: self.schedule_source_dependent_refresh(),
         )
 
         self._readiness_after_id = None
@@ -1403,6 +1749,9 @@ class PS2ClassicsGUIMod:
         self.version.set("")
         self.disc_id_cache_path = None
         self.disc_id_cache_value = None
+        self.auto_image_type_path = None
+        self.image_type_detection.set("")
+        self.reset_compatibility_display()
 
         if (
             self.auto_config_path
@@ -1492,13 +1841,54 @@ class PS2ClassicsGUIMod:
         )
 
         if filename:
-            self.disc_id_cache_path = None
-            self.disc_id_cache_value = None
             self.iso_path.set(filename)
             self.remember_path("source", filename)
-            self.auto_populate_metadata()
+            self.refresh_source_dependent_data(force=True)
+
+    def schedule_source_dependent_refresh(self):
+        if self._source_refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self._source_refresh_after_id)
+            except tk.TclError:
+                pass
+
+        self._source_refresh_after_id = self.root.after(
+            300,
+            self.refresh_source_dependent_data,
+        )
+
+    def refresh_source_dependent_data(self, force=False):
+        self._source_refresh_after_id = None
+        source_text = self.iso_path.get().strip()
+
+        if not force and source_text == self._last_source_refresh_path:
+            return
+
+        self._last_source_refresh_path = source_text
+        self.disc_id_cache_path = None
+        self.disc_id_cache_value = None
+        self.auto_image_type_path = None
+        self.auto_config_path = ""
+        self.param_hip_path.set("")
+
+        if not source_text or not Path(source_text).is_file():
+            self.detected_disc_id.set("")
+            self.image_type_detection.set("")
+            self.reset_compatibility_display()
             self.update_encrypt_option_state()
             self.update_build_readiness()
+            return
+
+        if self.input_mode.get() == "encrypted":
+            self.image_type_detection.set("")
+        else:
+            self.auto_detect_image_type(source_text)
+
+        self.auto_populate_metadata()
+        self.populate_config_field(self.detected_disc_id.get().strip())
+        self.schedule_compatibility_check()
+        self.update_encrypt_option_state()
+        self.update_build_readiness()
 
     def browse_edat_source(self):
         self.choose_file(
@@ -1566,6 +1956,1089 @@ class PS2ClassicsGUIMod:
         )
         if selected:
             self.auto_config_path = ""
+
+    def _urlopen_bytes(self, url, timeout=30):
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }
+        request = urllib.request.Request(url, headers=headers)
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=timeout,
+                ) as response:
+                    return response.read()
+            except (urllib.error.HTTPError, urllib.error.URLError) as error:
+                last_error = error
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+
+        raise RuntimeError(f"Network request failed: {last_error}")
+
+    def _urlopen_json(self, url, timeout=30):
+        data = self._urlopen_bytes(url, timeout=timeout)
+        return json.loads(data.decode("utf-8"))
+
+    def update_configs(self):
+        if self.config_update_running:
+            return
+
+        confirmed = messagebox.askyesno(
+            "Update configs",
+            (
+                "Download the latest PS2 CONFIG files and overwrite matching "
+                "files in the local CONFIGS folder?"
+            ),
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        self.config_update_running = True
+        self.update_configs_button.pack_forget()
+        self.config_update_progress["value"] = 0
+        self.config_update_progress_frame.pack(fill="both", expand=True)
+        self.rescan_configs_button.configure(state=tk.DISABLED)
+        self.config_update_status.set("Preparing CONFIG update…")
+
+        worker = threading.Thread(
+            target=self._config_update_worker,
+            daemon=True,
+        )
+        worker.start()
+
+    @staticmethod
+    def _archive_request_headers():
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "application/zip,application/octet-stream,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def _download_config_archive(self, destination):
+        last_error = None
+
+        for url in self.CONFIG_ARCHIVE_URLS:
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers=self._archive_request_headers(),
+                )
+                with urllib.request.urlopen(request, timeout=45) as response:
+                    total_header = response.headers.get("Content-Length", "")
+                    try:
+                        total_bytes = int(total_header)
+                    except (TypeError, ValueError):
+                        total_bytes = 0
+
+                    downloaded = 0
+                    last_percent = -1
+                    with open(destination, "wb") as output:
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                            downloaded += len(chunk)
+
+                            if total_bytes > 0:
+                                download_fraction = min(
+                                    1.0,
+                                    downloaded / total_bytes,
+                                )
+                                percent = int(download_fraction * 70)
+                            else:
+                                # The exact archive size is unknown until EOF.
+                                # Keep visible progress moving without pretending
+                                # the download phase is already complete.
+                                percent = min(65, 5 + downloaded // (2 * 1024 * 1024))
+
+                            if percent != last_percent:
+                                last_percent = percent
+                                if total_bytes > 0:
+                                    status = (
+                                        "Downloading CONFIG archive… "
+                                        f"{int(download_fraction * 100)}%"
+                                    )
+                                else:
+                                    mib = downloaded / (1024 * 1024)
+                                    status = f"Downloading CONFIG archive… {mib:.1f} MiB"
+                                self.config_update_queue.put(
+                                    ("progress", percent, status)
+                                )
+
+                if not destination.is_file() or destination.stat().st_size == 0:
+                    raise RuntimeError("The downloaded archive is empty.")
+
+                self.config_update_queue.put(
+                    ("progress", 70, "CONFIG archive downloaded · installing…")
+                )
+                return url
+            except Exception as error:
+                last_error = error
+                destination.unlink(missing_ok=True)
+
+        raise RuntimeError(
+            "Could not download the webMAN-MOD CONFIG archive: "
+            f"{last_error}"
+        )
+
+    def _install_configs_from_archive(self, archive_path):
+        config_root = self.script_dir / "CONFIGS"
+        config_root.mkdir(parents=True, exist_ok=True)
+        marker = self.CONFIG_ARCHIVE_PATH.casefold()
+
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            members = []
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+
+                normalized = info.filename.replace("\\", "/")
+                lower_name = normalized.casefold()
+                marker_index = lower_name.find(marker)
+                if marker_index < 0:
+                    continue
+
+                relative_text = normalized[
+                    marker_index + len(self.CONFIG_ARCHIVE_PATH):
+                ]
+                if not relative_text:
+                    continue
+                if relative_text.casefold().endswith((".html", ".htm")):
+                    continue
+
+                relative = PurePosixPath(relative_text)
+                if relative.is_absolute() or ".." in relative.parts:
+                    continue
+
+                members.append((info, relative))
+
+            if not members:
+                raise RuntimeError(
+                    "No PS2 CONFIG files were found in the downloaded archive."
+                )
+
+            total = len(members)
+            for index, (info, relative) in enumerate(members, start=1):
+                destination = config_root.joinpath(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_name(destination.name + ".download")
+
+                try:
+                    with archive.open(info, "r") as source, open(
+                        temporary,
+                        "wb",
+                    ) as target:
+                        shutil.copyfileobj(source, target, length=256 * 1024)
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+
+                if index == total or index % 25 == 0:
+                    install_fraction = index / total
+                    percent = 70 + int(install_fraction * 30)
+                    self.config_update_queue.put(
+                        (
+                            "progress",
+                            min(percent, 100),
+                            (
+                                f"Installing CONFIG files… {index} / {total} · "
+                                f"{int(install_fraction * 100)}%"
+                            ),
+                        )
+                    )
+
+        return total
+
+    def _config_update_worker(self):
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="ps2_config_update_"
+            ) as temporary_dir:
+                archive_path = Path(temporary_dir) / "webman_mod.zip"
+                self._download_config_archive(archive_path)
+                count = self._install_configs_from_archive(archive_path)
+
+            self.config_update_queue.put(("done", count))
+        except Exception as error:
+            self.config_update_queue.put(("error", str(error)))
+
+    def poll_config_update_queue(self):
+        try:
+            while True:
+                event = self.config_update_queue.get_nowait()
+                event_type = event[0]
+
+                if event_type == "progress":
+                    self.config_update_progress["value"] = event[1]
+                    self.config_update_status.set(event[2])
+                    continue
+
+                self.config_update_progress["value"] = 0
+                self.config_update_progress_frame.pack_forget()
+                self.update_configs_button.configure(
+                    state=tk.NORMAL,
+                    text="Update configs",
+                )
+                self.update_configs_button.pack(fill="both", expand=True)
+                self.rescan_configs_button.configure(state=tk.NORMAL)
+                self.config_update_running = False
+
+                if event_type == "done":
+                    count = event[1]
+                    self.config_update_status.set(
+                        f"Updated {count} CONFIG files."
+                    )
+                    self.log(f"CONFIG database updated: {count} files.")
+                    self.rescan_configs(show_message=False)
+                elif event_type == "error":
+                    self.config_update_status.set("CONFIG update failed.")
+                    self.log(f"CONFIG update failed: {event[1]}")
+                    messagebox.showerror(
+                        "CONFIG update failed",
+                        event[1],
+                        parent=self.root,
+                    )
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(150, self.poll_config_update_queue)
+        except tk.TclError:
+            pass
+
+    def rescan_configs(self, show_message=True):
+        disc_id = self.detected_disc_id.get().strip()
+        if not disc_id and self.iso_path.get().strip():
+            disc_id = self.refresh_disc_id_cache() or ""
+
+        if not disc_id:
+            self.config_update_status.set(
+                "No disc ID is available for CONFIG matching."
+            )
+            if show_message:
+                messagebox.showinfo(
+                    "Re-scan configs",
+                    "Select a source image with a detectable disc ID first.",
+                    parent=self.root,
+                )
+            return None
+
+        config_path = self.find_config_for_disc_id(disc_id)
+        if config_path:
+            self.auto_config_path = str(config_path)
+            self.param_hip_path.set(self.auto_config_path)
+            self.config_update_status.set(
+                f"CONFIG found: {config_path.parent.name}/{config_path.name}"
+            )
+            self.log(f"CONFIG re-scan matched: {config_path}")
+            self.schedule_build_readiness()
+            return config_path
+
+        self.config_update_status.set(
+            f"No CONFIG found for {disc_id}."
+        )
+        if show_message:
+            messagebox.showinfo(
+                "Re-scan configs",
+                f"No matching CONFIG was found for {disc_id}.",
+                parent=self.root,
+            )
+        return None
+
+    def compatibility_cache_path(self):
+        return self.script_dir / self.COMPATIBILITY_CACHE_FILE
+
+    def compatibility_cache_exists(self):
+        path = self.compatibility_cache_path()
+        if not path.is_file():
+            return False
+
+        try:
+            with sqlite3.connect(path) as connection:
+                row = connection.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()
+            return bool(row and row[0] == "1")
+        except (sqlite3.Error, OSError):
+            return False
+
+    def update_compat_cache_button(self):
+        if not hasattr(self, "compat_cache_button"):
+            return
+
+        if self.compat_cache_running:
+            self.compat_cache_button.configure(
+                text="Loading…",
+                state=tk.DISABLED,
+            )
+            return
+
+        self.compat_cache_button.configure(
+            text=(
+                "Refresh"
+                if self.compatibility_cache_exists()
+                else "Build cache"
+            ),
+            state=tk.NORMAL,
+        )
+
+    def reset_compatibility_display(self):
+        if self.compatibility_cache_exists():
+            self.compatibility_status.set("Not checked")
+        else:
+            self.compatibility_status.set("No cache")
+
+        self.compatibility_status_label.configure(
+            bg=self.COLOR_PANEL,
+            fg=self.COLOR_TEXT_MUTED,
+        )
+        self.compatibility_match.set("")
+        self.compatibility_notes.set("")
+        self.compatibility_notes_expanded = False
+        self.compatibility_notes_label.pack_forget()
+        self.compatibility_notes_button.configure(
+            text="Notes",
+            state=tk.DISABLED,
+        )
+        self.update_compat_cache_button()
+
+    def toggle_compatibility_notes(self):
+        if not self.compatibility_notes.get().strip():
+            return
+
+        self.compatibility_notes_expanded = (
+            not self.compatibility_notes_expanded
+        )
+        self.compatibility_notes_button.configure(
+            text=(
+                "▼ Notes"
+                if self.compatibility_notes_expanded
+                else "▶ Notes"
+            )
+        )
+
+        if self.compatibility_notes_expanded:
+            self.compatibility_notes_label.pack(
+                fill="x",
+                padx=(12, 8),
+                pady=(2, 3),
+            )
+        else:
+            self.compatibility_notes_label.pack_forget()
+
+    def refresh_compatibility_cache(self):
+        if self.compat_cache_running:
+            return
+
+        self.compatibility_source_override = None
+
+        if not self.compatibility_cache_exists():
+            source = self.find_local_compatibility_snapshot()
+            if source is None:
+                selected = filedialog.askopenfilename(
+                    title="Select PSDevWiki compatibility HTML snapshot",
+                    initialdir=str(self.script_dir),
+                    filetypes=[
+                        ("HTML snapshot", "*.html *.htm"),
+                        ("All files", "*.*"),
+                    ],
+                )
+                if not selected:
+                    return
+                source = Path(selected)
+            self.compatibility_source_override = source
+
+        self.compat_cache_running = True
+        self.update_compat_cache_button()
+
+        worker = threading.Thread(
+            target=self._compat_cache_worker,
+            daemon=True,
+        )
+        worker.start()
+
+    def find_local_compatibility_snapshot(self):
+        for filename in self.COMPATIBILITY_LOCAL_HTML_NAMES:
+            candidate = self.script_dir / filename
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _load_compatibility_source_html(self):
+        candidates = []
+        if self.compatibility_source_override:
+            candidates.append(Path(self.compatibility_source_override))
+
+        local_default = self.find_local_compatibility_snapshot()
+        if local_default and local_default not in candidates:
+            candidates.append(local_default)
+
+        errors = []
+        for candidate in candidates:
+            try:
+                text = candidate.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                if (
+                    "Compatibility Notes" in text
+                    and "PS2 Classic" in text
+                ):
+                    return text, str(candidate)
+                errors.append(f"{candidate}: unexpected page content")
+            except OSError as error:
+                errors.append(f"{candidate}: {error}")
+
+        raise RuntimeError(
+            "No local PSDevWiki compatibility snapshot is available. "
+            "Copy the bundled comp_cache.db into the application root, or "
+            "save the compatibility page as HTML and select that file."
+            + ("\n\n" + "\n".join(errors[-3:]) if errors else "")
+        )
+
+    def _download_datacenter_title_maps(self):
+        title_maps = {}
+        title_errors = []
+
+        for region_name, url in self.DATACENTER_URLS.items():
+            try:
+                data = self._urlopen_bytes(url, timeout=30)
+                page = data.decode("windows-1252", errors="ignore")
+                parser = _DataCenterListParser()
+                parser.feed(page)
+                if not parser.entries:
+                    raise RuntimeError("no serial/title rows were found")
+                title_maps[region_name] = parser.entries
+            except Exception as error:
+                title_errors.append(f"{region_name}: {error}")
+
+        return title_maps, title_errors
+
+    def _create_compatibility_database(self, temporary, rows, source_name):
+        with sqlite3.connect(temporary) as connection:
+            connection.execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE compatibility (
+                    id INTEGER PRIMARY KEY,
+                    names TEXT NOT NULL,
+                    pal TEXT NOT NULL,
+                    ntsc_u TEXT NOT NULL,
+                    ntsc_j TEXT NOT NULL,
+                    notes TEXT NOT NULL,
+                    serials TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE titles (
+                    region TEXT NOT NULL,
+                    serial TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    PRIMARY KEY (region, serial)
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO compatibility
+                (names, pal, ntsc_u, ntsc_j, notes, serials)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        json.dumps(row.get("names", []), ensure_ascii=False),
+                        (row.get("statuses") or ["", "", ""])[0],
+                        (row.get("statuses") or ["", "", ""])[1],
+                        (row.get("statuses") or ["", "", ""])[2],
+                        row.get("notes", ""),
+                        json.dumps(row.get("serials", []), ensure_ascii=False),
+                    )
+                    for row in rows
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO meta(key, value) VALUES (?, ?)",
+                {
+                    "schema_version": "1",
+                    "created_unix": str(int(time.time())),
+                    "compatibility_source": source_name,
+                    "compatibility_rows": str(len(rows)),
+                    "title_rows": "0",
+                }.items(),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _refresh_title_table(database_path, title_maps):
+        with sqlite3.connect(database_path) as connection:
+            for region_name, entries in title_maps.items():
+                connection.execute(
+                    "DELETE FROM titles WHERE region = ?",
+                    (region_name,),
+                )
+                connection.executemany(
+                    "INSERT OR REPLACE INTO titles(region, serial, title) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        (region_name, serial, title)
+                        for serial, title in entries.items()
+                    ),
+                )
+
+            title_count = connection.execute(
+                "SELECT COUNT(*) FROM titles"
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("title_rows", str(title_count)),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("title_refresh_unix", str(int(time.time()))),
+            )
+            connection.commit()
+            return title_count
+
+    def _compat_cache_worker(self):
+        cache_path = self.compatibility_cache_path()
+        temporary = cache_path.with_suffix(".db.tmp")
+        temporary.unlink(missing_ok=True)
+
+        try:
+            if self.compatibility_cache_exists():
+                shutil.copy2(cache_path, temporary)
+                with sqlite3.connect(temporary) as connection:
+                    compat_count = connection.execute(
+                        "SELECT COUNT(*) FROM compatibility"
+                    ).fetchone()[0]
+            else:
+                html_text, source_name = self._load_compatibility_source_html()
+                rows = self._extract_compatibility_rows(html_text)
+                if not rows:
+                    raise RuntimeError(
+                        "No compatibility rows were found in the HTML snapshot."
+                    )
+                self._create_compatibility_database(
+                    temporary,
+                    rows,
+                    source_name,
+                )
+                compat_count = len(rows)
+
+            title_maps, title_errors = self._download_datacenter_title_maps()
+            title_count = self._refresh_title_table(temporary, title_maps)
+
+            os.replace(temporary, cache_path)
+            self._local_compatibility_rows = None
+            self.compat_cache_queue.put(
+                (
+                    "done",
+                    compat_count,
+                    title_count,
+                    title_errors,
+                )
+            )
+        except Exception as error:
+            self.compat_cache_queue.put(("error", str(error)))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def poll_compat_cache_queue(self):
+        try:
+            while True:
+                event = self.compat_cache_queue.get_nowait()
+                event_type = event[0]
+                self.compat_cache_running = False
+                self.update_compat_cache_button()
+
+                if event_type == "done":
+                    compat_count, title_count, title_errors = event[1:]
+                    self.log(
+                        "Compatibility cache updated: "
+                        f"{compat_count} compatibility rows, "
+                        f"{title_count} title mappings."
+                    )
+                    if title_errors:
+                        self.log(
+                            "Compatibility cache title warnings: "
+                            + "; ".join(title_errors)
+                        )
+                    if self.iso_path.get().strip():
+                        self.schedule_compatibility_check()
+                    else:
+                        self.reset_compatibility_display()
+                    continue
+
+                self.log(f"Compatibility cache update failed: {event[1]}")
+                messagebox.showerror(
+                    "Compatibility cache",
+                    event[1],
+                    parent=self.root,
+                )
+                self.reset_compatibility_display()
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(150, self.poll_compat_cache_queue)
+        except tk.TclError:
+            pass
+
+    def schedule_compatibility_check(self):
+        if self.compatibility_after_id is not None:
+            try:
+                self.root.after_cancel(self.compatibility_after_id)
+            except tk.TclError:
+                pass
+
+        if not self.iso_path.get().strip():
+            self.reset_compatibility_display()
+            self.compatibility_after_id = None
+            return
+
+        self.compatibility_after_id = self.root.after(
+            450,
+            self.start_compatibility_check,
+        )
+
+    def start_compatibility_check(self):
+        self.compatibility_after_id = None
+        source_text = self.iso_path.get().strip()
+        if not source_text:
+            self.reset_compatibility_display()
+            return
+
+        if not self.compatibility_cache_exists():
+            self.compatibility_status.set("No cache")
+            self.compatibility_status_label.configure(
+                bg=self.COLOR_PANEL,
+                fg=self.COLOR_TEXT_MUTED,
+            )
+            self.compatibility_match.set("")
+            self.compatibility_notes.set("")
+            self.compatibility_notes_button.configure(
+                text="Notes",
+                state=tk.DISABLED,
+            )
+            self.compatibility_notes_label.pack_forget()
+            self.update_compat_cache_button()
+            return
+
+        self.compatibility_request_id += 1
+        request_id = self.compatibility_request_id
+        disc_id = self.detected_disc_id.get().strip()
+        title = self.game_title.get().strip()
+
+        self.compatibility_status.set("Checking…")
+        self.compatibility_status_label.configure(
+            bg=self.COLOR_PANEL_ACTIVE,
+            fg=self.COLOR_TEXT_SOFT,
+        )
+        self.compatibility_match.set("")
+        self.compatibility_notes.set("")
+        self.compatibility_notes_button.configure(
+            text="Notes",
+            state=tk.DISABLED,
+        )
+        self.compatibility_notes_label.pack_forget()
+        self.compatibility_notes_expanded = False
+
+        worker = threading.Thread(
+            target=self._compatibility_worker,
+            args=(request_id, disc_id, title, source_text),
+            daemon=True,
+        )
+        worker.start()
+
+    def load_local_compatibility_rows(self):
+        if self._local_compatibility_rows is not None:
+            return self._local_compatibility_rows
+
+        cache_path = self.compatibility_cache_path()
+        if not self.compatibility_cache_exists():
+            raise RuntimeError("Compatibility cache is not available.")
+
+        rows = []
+        with sqlite3.connect(cache_path) as connection:
+            for names, pal, ntsc_u, ntsc_j, notes, serials in connection.execute(
+                """
+                SELECT names, pal, ntsc_u, ntsc_j, notes, serials
+                FROM compatibility
+                """
+            ):
+                rows.append(
+                    {
+                        "names": json.loads(names),
+                        "statuses": [pal, ntsc_u, ntsc_j],
+                        "notes": notes,
+                        "serials": json.loads(serials),
+                    }
+                )
+
+        self._local_compatibility_rows = rows
+        return rows
+
+    @staticmethod
+    def datacenter_serial(disc_id):
+        normalized = PS2ClassicsGUIMod.normalize_disc_id(disc_id or "")
+        if not normalized:
+            return ""
+
+        match = re.fullmatch(
+            r"([A-Z]{4})_([0-9]{3})\.([0-9]{2})",
+            normalized,
+        )
+        if not match:
+            return ""
+
+        return f"{match.group(1)}-{match.group(2)}{match.group(3)}"
+
+    def resolve_title_from_datacenter(self, disc_id):
+        serial = self.datacenter_serial(disc_id)
+        _region_index, region_name = self.compatibility_region(disc_id)
+        if not serial or not self.compatibility_cache_exists():
+            return "", "unavailable"
+
+        try:
+            with sqlite3.connect(self.compatibility_cache_path()) as connection:
+                row = connection.execute(
+                    "SELECT title FROM titles WHERE region = ? AND serial = ?",
+                    (region_name, serial),
+                ).fetchone()
+            if row:
+                return row[0], "cache"
+        except sqlite3.Error:
+            pass
+
+        return "", "cache"
+
+    @staticmethod
+    def normalize_compatibility_title(value):
+        value = unicodedata.normalize("NFKD", str(value))
+        value = "".join(
+            char for char in value
+            if not unicodedata.combining(char)
+        )
+        value = value.casefold()
+        value = value.replace("&", " and ")
+        value = re.sub(
+            r"\b(?:ps2|playstation\s*2|iso|bin|pal|ntsc|usa|europe|"
+            r"japan|japanese|german|ger|english|eng)\b",
+            " ",
+            value,
+        )
+        value = re.sub(r"[^a-z0-9]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _extract_compatibility_rows(html_text):
+        parser = _CompatibilityTableParser()
+        parser.feed(html_text)
+        parsed_rows = []
+        serial_pattern = re.compile(
+            r"(?:SLUS|SLES|SCUS|SCES|SLPM|SLPS|SCPS|SCAJ|SCKA|"
+            r"SCED|TCES|TCUS|PBPX|PAPX|PCPX|SCCS)"
+            r"[^0-9]{0,4}[0-9]{3}[^0-9]{0,3}[0-9]{2}",
+            re.IGNORECASE,
+        )
+
+        for cells in parser.rows:
+            if len(cells) < 5:
+                continue
+            if not all(
+                "compatibility-tag" in cells[index].get("class", "")
+                for index in (1, 2, 3)
+            ):
+                continue
+
+            title_text = cells[0].get("text", "")
+            names = []
+            for part in re.split(r"\s*[|•]\s*", title_text):
+                part = re.sub(r"\s+", " ", part).strip()
+                if part and part not in names:
+                    names.append(part)
+
+            row_text = " ".join(
+                [cell.get("text", "") for cell in cells]
+                + [
+                    meta
+                    for cell in cells
+                    for meta in cell.get("meta", [])
+                ]
+            )
+            serials = serial_pattern.findall(row_text)
+
+            parsed_rows.append(
+                {
+                    "names": names or [title_text],
+                    "statuses": [
+                        cells[1].get("text", "").strip(),
+                        cells[2].get("text", "").strip(),
+                        cells[3].get("text", "").strip(),
+                    ],
+                    "notes": cells[4].get("text", "").strip(),
+                    "serials": serials,
+                }
+            )
+
+        return parsed_rows
+
+    @staticmethod
+    def compatibility_region(disc_id):
+        prefix = str(disc_id).upper()[:4]
+        pal = {"SLES", "SCES", "SCED", "TCES"}
+        ntsc_u = {"SLUS", "SCUS", "TCUS"}
+        ntsc_j = {
+            "SLPM", "SLPS", "SCPS", "SCAJ", "SCKA", "SCCS",
+            "PAPX", "PBPX", "PCPX",
+        }
+
+        if prefix in pal:
+            return 0, "PAL-EU"
+        if prefix in ntsc_u:
+            return 1, "NTSC-U"
+        if prefix in ntsc_j:
+            return 2, "NTSC-J/Asia"
+        return None, "Region unknown"
+
+    def _compatibility_title_score(self, query, candidate):
+        query = self.normalize_compatibility_title(query)
+        candidate = self.normalize_compatibility_title(candidate)
+        if not query or not candidate:
+            return 0.0
+        if query == candidate:
+            return 1.0
+
+        sequence = difflib.SequenceMatcher(
+            None,
+            query,
+            candidate,
+        ).ratio()
+        query_tokens = set(query.split())
+        candidate_tokens = set(candidate.split())
+        union = query_tokens | candidate_tokens
+        overlap = (
+            len(query_tokens & candidate_tokens) / len(union)
+            if union
+            else 0.0
+        )
+
+        containment = 0.0
+        shorter = min(len(query), len(candidate))
+        longer = max(len(query), len(candidate))
+        if shorter >= 7 and (query in candidate or candidate in query):
+            containment = 0.88 + 0.12 * (shorter / longer)
+
+        return max(sequence, overlap, containment)
+
+    def find_compatibility_match(self, rows, disc_id, title, source_text):
+        normalized_disc = self.normalize_disc_id(disc_id or "")
+        compact_disc = (
+            re.sub(r"[^A-Z0-9]", "", normalized_disc)
+            if normalized_disc
+            else ""
+        )
+
+        if compact_disc:
+            for row in rows:
+                for serial in row.get("serials", []):
+                    normalized_serial = self.normalize_disc_id(serial)
+                    if not normalized_serial:
+                        continue
+                    if (
+                        re.sub(r"[^A-Z0-9]", "", normalized_serial)
+                        == compact_disc
+                    ):
+                        return row, 1.0, "disc ID"
+
+        queries = []
+        if title:
+            queries.append(title)
+        if source_text:
+            source_title = self.clean_title_from_path(source_text)
+            if source_title and source_title not in queries:
+                queries.append(source_title)
+
+        best_row = None
+        best_score = 0.0
+
+        for row in rows:
+            for query in queries:
+                for candidate in row.get("names", []):
+                    score = self._compatibility_title_score(
+                        query,
+                        candidate,
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_row = row
+
+        if best_row is not None and best_score >= 0.76:
+            return best_row, best_score, "title"
+
+        return None, best_score, "none"
+
+    def _compatibility_worker(
+        self,
+        request_id,
+        disc_id,
+        title,
+        source_text,
+    ):
+        try:
+            rows = self.load_local_compatibility_rows()
+            datacenter_title, datacenter_source = (
+                self.resolve_title_from_datacenter(disc_id)
+                if disc_id
+                else ("", "unavailable")
+            )
+
+            lookup_title = datacenter_title or title
+            row, _score, _match_method = self.find_compatibility_match(
+                rows,
+                disc_id,
+                lookup_title,
+                source_text,
+            )
+
+            if row is None and datacenter_title and title:
+                row, _score, _match_method = self.find_compatibility_match(
+                    rows,
+                    disc_id,
+                    title,
+                    source_text,
+                )
+
+            region_index, region_name = self.compatibility_region(disc_id)
+            serial = self.datacenter_serial(disc_id)
+
+            if row is None:
+                display_name = datacenter_title or title or "Unknown title"
+                status = "Not listed"
+                notes = ""
+            else:
+                statuses = row.get("statuses", [])
+                if region_index is None:
+                    region_index = next(
+                        (
+                            index
+                            for index, value in enumerate(statuses)
+                            if value not in {"", "Not Available"}
+                        ),
+                        0,
+                    )
+                    region_name = (
+                        "PAL-EU", "NTSC-U", "NTSC-J/Asia"
+                    )[region_index]
+
+                status = (
+                    statuses[region_index]
+                    if region_index < len(statuses)
+                    else "Unknown"
+                )
+                display_name = (
+                    datacenter_title
+                    or (row.get("names") or [title or "Unknown title"])[0]
+                )
+                notes = row.get("notes", "")
+
+            details = [
+                value
+                for value in (region_name, display_name, serial)
+                if value
+            ]
+            match_text = " · ".join(details)
+            if datacenter_source == "cache" or self.compatibility_cache_exists():
+                match_text += " (cache)"
+
+            self.compatibility_queue.put(
+                (
+                    "result",
+                    request_id,
+                    {
+                        "status": status or "Unknown",
+                        "notes": notes,
+                        "match": match_text,
+                    },
+                )
+            )
+        except Exception as error:
+            self.compatibility_queue.put(
+                ("error", request_id, str(error))
+            )
+
+    def poll_compatibility_queue(self):
+        try:
+            while True:
+                event = self.compatibility_queue.get_nowait()
+                event_type, request_id = event[0], event[1]
+
+                if request_id != self.compatibility_request_id:
+                    continue
+
+                if event_type == "error":
+                    self.compatibility_status.set("Unavailable")
+                    self.compatibility_status_label.configure(
+                        bg=self.COLOR_PANEL,
+                        fg=self.COLOR_TEXT_MUTED,
+                    )
+                    self.compatibility_match.set("")
+                    self.compatibility_notes.set("")
+                    self.compatibility_notes_button.configure(
+                        text="Notes",
+                        state=tk.DISABLED,
+                    )
+                    self.compatibility_notes_label.pack_forget()
+                    continue
+
+                result = event[2]
+                status = result.get("status", "Unknown")
+                colors = self.COMPATIBILITY_COLORS.get(
+                    status,
+                    (self.COLOR_PANEL, self.COLOR_TEXT_MUTED),
+                )
+                self.compatibility_status.set(status)
+                self.compatibility_status_label.configure(
+                    bg=colors[0],
+                    fg=colors[1],
+                )
+                self.compatibility_match.set(result.get("match", ""))
+
+                notes = result.get("notes", "").strip()
+                self.compatibility_notes.set(notes)
+                self.compatibility_notes_expanded = False
+                self.compatibility_notes_label.pack_forget()
+                self.compatibility_notes_button.configure(
+                    text="▶ Notes" if notes else "Notes",
+                    state=tk.NORMAL if notes else tk.DISABLED,
+                )
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(150, self.poll_compatibility_queue)
+        except tk.TclError:
+            pass
 
     def browse_vmc(self):
         self.choose_file(
@@ -1906,6 +3379,7 @@ class PS2ClassicsGUIMod:
 
         self.populate_default_asset_fields()
         self.schedule_preview()
+        self.schedule_compatibility_check()
         self.schedule_build_readiness()
 
     def asset_search_score(self, candidate, asset_name):
@@ -3079,11 +4553,94 @@ class PS2ClassicsGUIMod:
         )
 
     @staticmethod
+    def detect_image_sector_size(image_path):
+        """Detect 2048-byte ISO sectors or raw 2352-byte CD sectors."""
+        image_path = Path(image_path)
+        if not image_path.is_file():
+            return None
+
+        try:
+            size = image_path.stat().st_size
+            with image_path.open("rb") as handle:
+                first_sector = handle.read(32)
+
+                if (
+                    len(first_sector) >= 12
+                    and first_sector[:12]
+                    == b"\x00" + (b"\xff" * 10) + b"\x00"
+                ):
+                    return 2352
+
+                probes = (
+                    (16 * 2048, 2048),
+                    (16 * 2352, 2352),
+                )
+
+                for base_offset, sector_size in probes:
+                    handle.seek(base_offset)
+                    block = handle.read(96)
+                    for user_offset in (0, 16, 24):
+                        signature = block[user_offset:user_offset + 6]
+                        if signature == b"\x01CD001":
+                            return sector_size
+
+            divisible_2048 = size > 0 and size % 2048 == 0
+            divisible_2352 = size > 0 and size % 2352 == 0
+
+            if divisible_2352 and not divisible_2048:
+                return 2352
+            if divisible_2048 and not divisible_2352:
+                return 2048
+        except OSError:
+            return None
+
+        return None
+
+    def auto_detect_image_type(self, image_path):
+        if self.input_mode.get() != "raw":
+            self.image_type_detection.set("")
+            return None
+
+        image_path = Path(image_path)
+        try:
+            resolved = str(image_path.resolve())
+        except OSError:
+            resolved = str(image_path)
+
+        if self.auto_image_type_path == resolved:
+            return None
+
+        self.auto_image_type_path = resolved
+        sector_size = self.detect_image_sector_size(image_path)
+
+        if sector_size == 2352:
+            self.image_type.set("CD")
+            self.image_type_detection.set(
+                "Auto-detected: 2352-byte raw CD sectors. Manual override allowed."
+            )
+            self.log("Image type auto-detected: CD / BIN (2352 Byte).")
+            return "CD"
+
+        if sector_size == 2048:
+            self.image_type.set("DVD5 / DVD9")
+            self.image_type_detection.set(
+                "Auto-detected: 2048-byte sectors. Manual override allowed."
+            )
+            self.log("Image type auto-detected: DVD5 / DVD9 (2048 Byte).")
+            return "DVD5 / DVD9"
+
+        self.image_type_detection.set(
+            "Sector layout could not be detected automatically."
+        )
+        self.log("Image type could not be auto-detected; current selection kept.")
+        return None
+
+    @staticmethod
     def normalize_disc_id(value):
         value = str(value).upper()
         match = re.search(
             r"(SLUS|SLES|SCUS|SCES|SLPM|SLPS|SCPS|SCAJ|SCKA|"
-            r"SCED|TCES|TCUS|PBPX)"
+            r"SCED|TCES|TCUS|PBPX|PAPX|PCPX|SCCS)"
             r"[^0-9]*([0-9]{3})[^0-9]*([0-9]{2})",
             value,
         )
@@ -3103,7 +4660,7 @@ class PS2ClassicsGUIMod:
 
         pattern = re.compile(
             rb"(SLUS|SLES|SCUS|SCES|SLPM|SLPS|SCPS|SCAJ|SCKA|"
-            rb"SCED|TCES|TCUS|PBPX)"
+            rb"SCED|TCES|TCUS|PBPX|PAPX|PCPX|SCCS)"
             rb"[^0-9]{0,4}([0-9]{3})[^0-9]{0,3}([0-9]{2})",
             re.IGNORECASE,
         )
@@ -3154,6 +4711,9 @@ class PS2ClassicsGUIMod:
             configs_root / "NET",
             configs_root / "GX",
             configs_root / "SOFT",
+            configs_root / "ALT",
+            configs_root / "ENC",
+            configs_root / "ORIGINAL",
             configs_root,
         ]
 
@@ -3165,6 +4725,8 @@ class PS2ClassicsGUIMod:
 
             for candidate in root.rglob("*"):
                 if not candidate.is_file():
+                    continue
+                if candidate.suffix.lower() in {".html", ".htm"}:
                     continue
 
                 try:
@@ -4099,8 +5661,8 @@ class PS2ClassicsGUIMod:
             "LIMG added: "
             f"Typ={self.image_type.get()}, "
             f"sector size={sector_size}, "
-            f"Sektoren={sector_count}, "
-            f"Padding={padding} Byte."
+            f"Sectors={sector_count}, "
+            f"Padding={padding} bytes."
         )
 
     @staticmethod

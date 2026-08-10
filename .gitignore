@@ -9,6 +9,7 @@
 !preview.jpg
 !app.ico
 !app.png
+!comp_cache.db
 
 # Generated output and caches.
 _build/
