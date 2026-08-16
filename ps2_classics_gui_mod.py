@@ -149,10 +149,16 @@ class _DataCenterListParser(HTMLParser):
 
 
 class PS2ClassicsGUIMod:
-    APP_VERSION = "0.10.5"
+    APP_VERSION = "1.0.0"
     APP_NAME = "PS2 Classics GUI - Mod by Chrisser"
     APP_ID = "Chrisser.PS2ClassicsGUIMod"
     EMPTY_PACKAGE_KLICENSEE = "0" * 32
+
+    PACKAGE_IMAGE_SIZES = {
+        "ICON0.PNG": (320, 176),
+        "PIC0.PNG": (1000, 560),
+        "PIC1.PNG": (1920, 1080),
+    }
 
     CONFIG_ARCHIVE_URLS = (
         "https://codeload.github.com/aldostools/webMAN-MOD/zip/refs/heads/master",
@@ -255,6 +261,7 @@ class PS2ClassicsGUIMod:
         # Session-only state; no machine-specific settings file.
         self.last_dirs = {}
         self.auto_asset_paths = {}
+        self.manual_asset_paths = {}
         self.cleared_assets = set()
         self.building = False
         self.disc_id_cache_path = None
@@ -266,6 +273,8 @@ class PS2ClassicsGUIMod:
         self.compatibility_queue = queue.Queue()
         self.compatibility_after_id = None
         self.compatibility_request_id = 0
+        self.compatibility_spinner_after_id = None
+        self.compatibility_spinner_index = 0
         self.compatibility_notes_expanded = False
         self._local_compatibility_rows = None
         self.compat_cache_running = False
@@ -353,6 +362,7 @@ class PS2ClassicsGUIMod:
             self.last_dirs[key] = str(directory)
 
     def on_close(self):
+        self.stop_compatibility_spinner()
         self.root.destroy()
 
     @staticmethod
@@ -883,7 +893,7 @@ class PS2ClassicsGUIMod:
         self.individual_edat_checkbox = tk.Checkbutton(
             source_frame,
             text=(
-                "Create a game-specific EDAT with make_npdata.exe"
+                "Use a custom game-specific EDAT identity"
             ),
             variable=self.create_individual_edat,
             command=self.change_identity_mode,
@@ -902,8 +912,8 @@ class PS2ClassicsGUIMod:
         tk.Label(
             source_frame,
             text=(
-                "Off: use the universal placeholder EDAT/key inside a separate game PKG. "
-                "On: create a per-game EDAT using a local matching RAP."
+                "Off: create a fresh game EDAT with the universal PS2 Classics identity. "
+                "On: use the package Content ID and a matching RAP."
             ),
             fg=self.COLOR_DESCRIPTION_DARK,
             bg=self.COLOR_BG,
@@ -1498,6 +1508,9 @@ class PS2ClassicsGUIMod:
             self.input_mode,
             self.create_individual_edat,
             self.keep_encrypted_artifacts,
+            self.icon0_path,
+            self.pic0_path,
+            self.pic1_path,
         ):
             variable.trace_add(
                 "write",
@@ -1931,6 +1944,7 @@ class PS2ClassicsGUIMod:
             if asset_name:
                 self.cleared_assets.discard(asset_name)
                 self.auto_asset_paths.pop(asset_name, None)
+                self.manual_asset_paths[asset_name] = filename
             self.schedule_preview()
 
     def browse_snd0(self):
@@ -2299,6 +2313,7 @@ class PS2ClassicsGUIMod:
         )
 
     def reset_compatibility_display(self):
+        self.stop_compatibility_spinner()
         if self.compatibility_cache_exists():
             self.compatibility_status.set("Not checked")
         else:
@@ -2604,6 +2619,33 @@ class PS2ClassicsGUIMod:
         except tk.TclError:
             pass
 
+    def start_compatibility_spinner(self):
+        self.stop_compatibility_spinner()
+        self.compatibility_spinner_index = 0
+        self._tick_compatibility_spinner()
+
+    def stop_compatibility_spinner(self):
+        if self.compatibility_spinner_after_id is not None:
+            try:
+                self.root.after_cancel(self.compatibility_spinner_after_id)
+            except tk.TclError:
+                pass
+        self.compatibility_spinner_after_id = None
+
+    def _tick_compatibility_spinner(self):
+        frames = ("Checking ·", "Checking ··", "Checking ···")
+        self.compatibility_status.set(
+            frames[self.compatibility_spinner_index % len(frames)]
+        )
+        self.compatibility_spinner_index += 1
+        try:
+            self.compatibility_spinner_after_id = self.root.after(
+                220,
+                self._tick_compatibility_spinner,
+            )
+        except tk.TclError:
+            self.compatibility_spinner_after_id = None
+
     def schedule_compatibility_check(self):
         if self.compatibility_after_id is not None:
             try:
@@ -2629,6 +2671,7 @@ class PS2ClassicsGUIMod:
             return
 
         if not self.compatibility_cache_exists():
+            self.stop_compatibility_spinner()
             self.compatibility_status.set("No cache")
             self.compatibility_status_label.configure(
                 bg=self.COLOR_PANEL,
@@ -2649,7 +2692,7 @@ class PS2ClassicsGUIMod:
         disc_id = self.detected_disc_id.get().strip()
         title = self.game_title.get().strip()
 
-        self.compatibility_status.set("Checking…")
+        self.start_compatibility_spinner()
         self.compatibility_status_label.configure(
             bg=self.COLOR_PANEL_ACTIVE,
             fg=self.COLOR_TEXT_SOFT,
@@ -2686,12 +2729,24 @@ class PS2ClassicsGUIMod:
                 FROM compatibility
                 """
             ):
+                row_names = json.loads(names)
+                row_serials = json.loads(serials)
                 rows.append(
                     {
-                        "names": json.loads(names),
+                        "names": row_names,
                         "statuses": [pal, ntsc_u, ntsc_j],
                         "notes": notes,
-                        "serials": json.loads(serials),
+                        "serials": row_serials,
+                        "_normalized_names": [
+                            self.normalize_compatibility_title(value)
+                            for value in row_names
+                        ],
+                        "_compact_serials": {
+                            re.sub(r"[^A-Z0-9]", "", normalized)
+                            for value in row_serials
+                            for normalized in [self.normalize_disc_id(value)]
+                            if normalized
+                        },
                     }
                 )
 
@@ -2861,15 +2916,8 @@ class PS2ClassicsGUIMod:
 
         if compact_disc:
             for row in rows:
-                for serial in row.get("serials", []):
-                    normalized_serial = self.normalize_disc_id(serial)
-                    if not normalized_serial:
-                        continue
-                    if (
-                        re.sub(r"[^A-Z0-9]", "", normalized_serial)
-                        == compact_disc
-                    ):
-                        return row, 1.0, "disc ID"
+                if compact_disc in row.get("_compact_serials", set()):
+                    return row, 1.0, "disc ID"
 
         queries = []
         if title:
@@ -2879,16 +2927,54 @@ class PS2ClassicsGUIMod:
             if source_title and source_title not in queries:
                 queries.append(source_title)
 
+        normalized_queries = [
+            self.normalize_compatibility_title(value)
+            for value in queries
+        ]
+        normalized_queries = [value for value in normalized_queries if value]
+        if not normalized_queries:
+            return None, 0.0, "none"
+
+        # Exact normalized titles are common and should return immediately.
+        for row in rows:
+            names = row.get("_normalized_names") or [
+                self.normalize_compatibility_title(value)
+                for value in row.get("names", [])
+            ]
+            if any(query in names for query in normalized_queries):
+                return row, 1.0, "title"
+
+        # Cheap token/containment fallback avoids thousands of SequenceMatcher
+        # calls in the worker thread, which can otherwise starve Tk's UI loop.
         best_row = None
         best_score = 0.0
-
         for row in rows:
-            for query in queries:
-                for candidate in row.get("names", []):
-                    score = self._compatibility_title_score(
-                        query,
-                        candidate,
-                    )
+            names = row.get("_normalized_names") or []
+            for query in normalized_queries:
+                query_tokens = set(query.split())
+                for candidate in names:
+                    if not candidate:
+                        continue
+
+                    score = 0.0
+                    shorter = min(len(query), len(candidate))
+                    longer = max(len(query), len(candidate))
+                    if shorter >= 7 and (
+                        query in candidate or candidate in query
+                    ):
+                        score = max(
+                            score,
+                            0.88 + 0.12 * (shorter / longer),
+                        )
+
+                    candidate_tokens = set(candidate.split())
+                    union = query_tokens | candidate_tokens
+                    if union:
+                        score = max(
+                            score,
+                            len(query_tokens & candidate_tokens) / len(union),
+                        )
+
                     if score > best_score:
                         best_score = score
                         best_row = row
@@ -2997,6 +3083,7 @@ class PS2ClassicsGUIMod:
                     continue
 
                 if event_type == "error":
+                    self.stop_compatibility_spinner()
                     self.compatibility_status.set("Unavailable")
                     self.compatibility_status_label.configure(
                         bg=self.COLOR_PANEL,
@@ -3011,6 +3098,7 @@ class PS2ClassicsGUIMod:
                     self.compatibility_notes_label.pack_forget()
                     continue
 
+                self.stop_compatibility_spinner()
                 result = event[2]
                 status = result.get("status", "Unknown")
                 colors = self.COMPATIBILITY_COLORS.get(
@@ -3105,6 +3193,7 @@ class PS2ClassicsGUIMod:
             if variable is asset_variable:
                 self.cleared_assets.add(asset_name)
                 self.auto_asset_paths.pop(asset_name, None)
+                self.manual_asset_paths.pop(asset_name, None)
                 variable.set("")
                 self.schedule_preview()
                 return
@@ -3117,6 +3206,12 @@ class PS2ClassicsGUIMod:
     def populate_default_asset_fields(self, force=False):
         for asset_name, variable in self.asset_variable_map().items():
             if asset_name in self.cleared_assets:
+                continue
+
+            manual = self.manual_asset_paths.get(asset_name, "")
+            if manual:
+                if variable.get().strip() != manual:
+                    variable.set(manual)
                 continue
 
             current = variable.get().strip()
@@ -3471,9 +3566,51 @@ class PS2ClassicsGUIMod:
         source = self.resolve_asset_path(asset_name, selected_text)
         if not source:
             return False
+
+        destination = Path(destination)
+        destination.unlink(missing_ok=True)
         self.copy_image_as_png(source, destination)
+        self.validate_package_image_asset(asset_name, destination)
         self.log(f"{asset_name} source: {source}")
         return True
+
+    def snapshot_package_asset_sources(self):
+        """Freeze the visible/manual asset choices for the current build."""
+        sources = {}
+        for asset_name, variable in self.asset_variable_map().items():
+            selected_text = (
+                self.manual_asset_paths.get(asset_name)
+                or variable.get().strip()
+            )
+            if not selected_text:
+                sources[asset_name] = None
+                continue
+
+            source = Path(selected_text)
+            if not source.is_file():
+                raise RuntimeError(
+                    f"{asset_name} source no longer exists: {source}"
+                )
+            sources[asset_name] = source.resolve()
+        return sources
+
+    def validate_package_image_asset(self, asset_name, path):
+        path = Path(path)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(f"{asset_name} was not written correctly.")
+
+        target_size = self.PACKAGE_IMAGE_SIZES.get(asset_name.upper())
+        if Image is None or not target_size:
+            return
+
+        with Image.open(path) as image:
+            if image.format != "PNG":
+                raise RuntimeError(f"{asset_name} is not a PNG file.")
+            if image.size != target_size:
+                raise RuntimeError(
+                    f"{asset_name} has size {image.size[0]}x{image.size[1]}, "
+                    f"expected {target_size[0]}x{target_size[1]}."
+                )
 
     @staticmethod
     def point_in_rect(x, y, rect):
@@ -4004,9 +4141,9 @@ class PS2ClassicsGUIMod:
         pkg_tool = self.find_pkg_tool()
         template = self.find_template_dir()
         placeholder = self.get_placeholder_identity() if template else {}
-        placeholder_edat = (
-            template / "USRDIR" / "ISO.BIN.EDAT" if template else None
-        )
+        placeholder_rap = self.find_placeholder_rap() if template else None
+        custom_rap = self.find_rap_file(content_id) if individual_mode else None
+        edat_rap = custom_rap if individual_mode else placeholder_rap
 
         manual_config = bool(
             self.param_hip_path.get().strip()
@@ -4056,18 +4193,24 @@ class PS2ClassicsGUIMod:
             )
             requirements.append(
                 (
-                    "EDAT identity mode",
-                    bool(make_npdata) if individual_mode else bool(
-                        placeholder_edat and placeholder_edat.is_file()
-                    ),
+                    "EDAT creation",
+                    bool(make_npdata and edat_rap),
                     (
-                        f"individual EDAT via {make_npdata or 'missing make_npdata.exe'}"
+                        "custom package identity via "
+                        + str(custom_rap or "missing matching RAP")
                         if individual_mode
                         else (
-                            "universal placeholder EDAT: "
-                            + str(placeholder_edat or "missing")
+                            "universal PS2 Classics identity via "
+                            + str(placeholder_rap or "missing placeholder RAP")
                         )
                     ),
+                )
+            )
+            requirements.append(
+                (
+                    "make_npdata.exe",
+                    bool(make_npdata),
+                    str(make_npdata or "required to create ISO.BIN.EDAT"),
                 )
             )
 
@@ -4277,15 +4420,36 @@ class PS2ClassicsGUIMod:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
 
-        if source_path.suffix.lower() == ".png":
-            shutil.copy2(source_path, destination)
-        else:
-            if Image is None:
-                raise RuntimeError(
-                    "Pillow is required for image conversion."
+        if Image is None:
+            if source_path.suffix.lower() == ".png":
+                shutil.copy2(source_path, destination)
+                return True
+            raise RuntimeError("Pillow is required for image conversion.")
+
+        with Image.open(source_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGBA")
+            asset_name = destination.name.upper()
+            target_size = self.PACKAGE_IMAGE_SIZES.get(asset_name)
+
+            if target_size:
+                resampling = getattr(Image, "Resampling", Image)
+                fitted = ImageOps.contain(
+                    image,
+                    target_size,
+                    method=resampling.LANCZOS,
                 )
-            with Image.open(source_path) as image:
-                image.convert("RGBA").save(destination, "PNG")
+                canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
+                x = (target_size[0] - fitted.width) // 2
+                y = (target_size[1] - fitted.height) // 2
+                canvas.alpha_composite(fitted, (x, y))
+                canvas.save(destination, "PNG", optimize=True)
+                self.log(
+                    f"{asset_name} normalized to "
+                    f"{target_size[0]}x{target_size[1]} without stretching: "
+                    f"{source_path}"
+                )
+            else:
+                image.save(destination, "PNG", optimize=True)
 
         return True
 
@@ -4480,6 +4644,15 @@ class PS2ClassicsGUIMod:
         """Patch SFO text fields and add missing required fields."""
         sfo_path = Path(sfo_path)
         version, entries = self.read_param_sfo(sfo_path)
+
+        updates = dict(updates)
+        title = str(updates.get("TITLE", "")).strip()
+        if title:
+            # PS3 HDD content can use localized TITLE_xx fields. Mirror the
+            # selected title into all PS3 language slots to avoid stale/template
+            # localized names overriding the default TITLE on the XMB.
+            for language_index in range(20):
+                updates[f"TITLE_{language_index:02d}"] = title
 
         by_key = {entry["key"]: entry for entry in entries}
         changed = []
@@ -5340,6 +5513,7 @@ class PS2ClassicsGUIMod:
         package_content_id,
         edat_content_id,
         expected_title_id,
+        expected_title,
         expected_version,
         expected_game_id,
         make_npdata,
@@ -5401,11 +5575,16 @@ class PS2ClassicsGUIMod:
 
         extracted = {}
 
-        for name in (
+        verify_names = [
             "PARAM.SFO",
             "ICON0.PNG",
             "USRDIR/ISO.BIN.EDAT",
-        ):
+        ]
+        for optional_asset in ("PIC0.PNG", "PIC1.PNG"):
+            if optional_asset in entry_map:
+                verify_names.append(optional_asset)
+
+        for name in verify_names:
             entry = entry_map[name.upper()]
             destination = verify_dir / name
             extracted[name] = self.extract_pkg_entry(
@@ -5415,10 +5594,12 @@ class PS2ClassicsGUIMod:
                 destination,
             )
 
-        # Compare small required files byte for byte.
+        # Compare metadata and XMB assets byte for byte.
         source_map = {
             "PARAM.SFO": package_dir / "PARAM.SFO",
             "ICON0.PNG": package_dir / "ICON0.PNG",
+            "PIC0.PNG": package_dir / "PIC0.PNG",
+            "PIC1.PNG": package_dir / "PIC1.PNG",
             "USRDIR/ISO.BIN.EDAT": (
                 package_dir / "USRDIR" / "ISO.BIN.EDAT"
             ),
@@ -5446,11 +5627,15 @@ class PS2ClassicsGUIMod:
         sfo_values = self.sfo_to_values(extracted["PARAM.SFO"])
 
         expected_sfo = {
+            "TITLE": expected_title,
             "TITLE_ID": expected_title_id,
             "CATEGORY": "2P",
             "BOOTABLE": "1",
             "VERSION": expected_version,
         }
+
+        for language_index in range(20):
+            expected_sfo[f"TITLE_{language_index:02d}"] = expected_title
 
         for key, expected in expected_sfo.items():
             found = str(sfo_values.get(key, ""))
@@ -5467,6 +5652,7 @@ class PS2ClassicsGUIMod:
             expected_game_id,
         )
 
+        edat_payload_verified = False
         if all((expected_game_id, make_npdata, rap_path, klic_bin_path)):
             shutil.copy2(
                 klic_bin_path,
@@ -5480,6 +5666,7 @@ class PS2ClassicsGUIMod:
                 expected_game_id,
                 verify_dir,
             )
+            edat_payload_verified = True
         else:
             self.log(
                 "EDAT payload decryption was skipped because the required "
@@ -5495,15 +5682,36 @@ class PS2ClassicsGUIMod:
             f"EDAT/ENC Content ID: {edat_content_id}",
             f"Install directory: {package_dir.name}",
             f"Entries: {pkg_info['item_count']}",
+            f"TITLE: {sfo_values.get('TITLE')}",
+            f"TITLE_04: {sfo_values.get('TITLE_04')}",
             f"TITLE_ID: {sfo_values.get('TITLE_ID')}",
             f"CATEGORY: {sfo_values.get('CATEGORY')}",
             f"BOOTABLE: {sfo_values.get('BOOTABLE')}",
             f"VERSION: {sfo_values.get('VERSION')}",
             f"EDAT Payload: {expected_game_id or 'not decrypted'}",
+            f"EDAT Payload Verified: {'Yes' if edat_payload_verified else 'No'}",
             f"ISO.BIN.ENC size: {enc_entry['file_size']}",
             "",
-            "PKG file list:",
+            "XMB assets:",
         ]
+
+        for asset_name in ("ICON0.PNG", "PIC0.PNG", "PIC1.PNG"):
+            asset_path = extracted.get(asset_name)
+            if not asset_path:
+                report_lines.append(f"{asset_name}: omitted")
+                continue
+            if Image is not None:
+                with Image.open(asset_path) as image:
+                    report_lines.append(
+                        f"{asset_name}: {image.size[0]}x{image.size[1]} PNG · "
+                        f"SHA-256 {self.sha256_file(asset_path)}"
+                    )
+            else:
+                report_lines.append(
+                    f"{asset_name}: SHA-256 {self.sha256_file(asset_path)}"
+                )
+
+        report_lines.extend(["", "PKG file list:"])
 
         for entry in sorted(
             pkg_info["entries"],
@@ -5529,6 +5737,7 @@ class PS2ClassicsGUIMod:
         self.log(f"  Install directory: {package_dir.name}")
         self.log(f"  PARAM.SFO: {expected_sfo}")
         self.log(f"  EDAT Payload: {expected_game_id or 'not decrypted'}")
+        self.log(f"  EDAT Payload Verified: {'Yes' if edat_payload_verified else 'No'}")
         self.log(f"  Verification report: {report_path}")
 
         return report_path
@@ -5650,7 +5859,7 @@ class PS2ClassicsGUIMod:
     # -------------------------------------------------------
 
     def create_limg_copy(self, source, destination):
-        """Create a temporary image copy with a 0x4000-byte LIMG block."""
+        """Create a temporary image copy with a PS2 Classics LIMG block."""
         source = Path(source)
         destination = Path(destination)
 
@@ -5662,37 +5871,56 @@ class PS2ClassicsGUIMod:
             "Preparing temporary LIMG image",
         )
 
-        if self.image_type.get() == "CD":
-            sector_size = 0x930
-            data_mode = 2
-        else:
-            sector_size = 0x800
-            data_mode = 1
+        is_cd = self.image_type.get() == "CD"
+        block_size = 0x930 if is_cd else 0x800
+        image_type = 2 if is_cd else 1
+        pvd_base = 0x9318 if is_cd else 0x8000
 
-        original_size = destination.stat().st_size
+        with destination.open("r+b") as handle:
+            file_size = destination.stat().st_size
+            if file_size >= 0x4000:
+                handle.seek(-0x4000, os.SEEK_END)
+                if handle.read(4) == b"LIMG":
+                    self.log("LIMG already present; temporary image kept unchanged.")
+                    return
 
-        with destination.open("ab") as handle:
-            # Align the header to 0x4000.
-            padding = (-original_size) % 0x4000
+            # ISO9660 Volume Space Size stores a big-endian sector count at
+            # PVD + 0x54. Raw CD images have a 24-byte sector user-data offset.
+            handle.seek(pvd_base + 0x54)
+            sector_data = handle.read(4)
+            if len(sector_data) != 4:
+                raise RuntimeError(
+                    "Could not read the ISO9660 sector count required for LIMG."
+                )
+
+            sector_count = struct.unpack(">I", sector_data)[0]
+            if sector_count <= 0:
+                raise RuntimeError(
+                    "The ISO9660 sector count is invalid; LIMG was not created."
+                )
+
+            # LIMG alignment is based on the logical 2048-byte ISO data size,
+            # even when the source is a raw 2352-byte CD/BIN image.
+            remainder = (sector_count * 0x800) % 0x4000
+            padding = (0x4000 - remainder) if remainder else 0
+
+            handle.seek(0, os.SEEK_END)
             if padding:
                 handle.write(b"\x00" * padding)
 
-            padded_image_size = original_size + padding
-            sector_count = padded_image_size // sector_size
-
             header = bytearray(0x4000)
             header[0:4] = b"LIMG"
-            header[4:8] = struct.pack(">I", sector_count)
-            header[8] = data_mode
-            header[14:16] = struct.pack(">H", sector_size)
+            struct.pack_into(">I", header, 4, image_type)
+            struct.pack_into(">I", header, 8, sector_count)
+            struct.pack_into(">I", header, 12, block_size)
             handle.write(header)
 
         self.log(
             "LIMG added: "
-            f"Typ={self.image_type.get()}, "
-            f"sector size={sector_size}, "
-            f"Sectors={sector_count}, "
-            f"Padding={padding} bytes."
+            f"type={'CD' if is_cd else 'DVD'}, "
+            f"sector size={block_size}, "
+            f"sectors={sector_count}, "
+            f"padding={padding} bytes."
         )
 
     @staticmethod
@@ -5805,9 +6033,10 @@ class PS2ClassicsGUIMod:
                     "Raw-image mode requires ps2classic.exe and a detected "
                     "PS2 disc ID."
                 )
-            if individual_mode and not make_npdata:
+            if not encrypted_mode and not make_npdata:
                 raise RuntimeError(
-                    "Individual-EDAT mode requires make_npdata.exe."
+                    "Raw-image mode requires make_npdata.exe to create "
+                    "a fresh ISO.BIN.EDAT for the selected game."
                 )
 
             self.log(f"--- PS2 Classics PKG Builder v{self.APP_VERSION} ---")
@@ -5822,9 +6051,9 @@ class PS2ClassicsGUIMod:
                     "existing sidecar"
                     if encrypted_mode
                     else (
-                        "individual make_npdata EDAT/RAP"
+                        "custom package Content ID with matching RAP"
                         if individual_mode
-                        else "original PS2 Classics GUI placeholder"
+                        else "universal identity with game-specific payload"
                     )
                 )
             )
@@ -5889,6 +6118,13 @@ class PS2ClassicsGUIMod:
             self.log(f"Install directory: {package_dir.name}")
             self.set_progress(7)
 
+            asset_sources = self.snapshot_package_asset_sources()
+            for asset_name, source in asset_sources.items():
+                self.log(
+                    f"Build asset {asset_name}: "
+                    f"{source if source else 'omitted'}"
+                )
+
             self.title_id.set(package_title_id)
             param_sfo = package_dir / "PARAM.SFO"
             self.patch_param_sfo(
@@ -5909,7 +6145,7 @@ class PS2ClassicsGUIMod:
             self.set_progress(12)
 
             stale_edat = usrdir / "ISO.BIN.EDAT"
-            if individual_mode and stale_edat.exists():
+            if not encrypted_mode and stale_edat.exists():
                 stale_edat.unlink()
 
             rap_path = None
@@ -5917,6 +6153,14 @@ class PS2ClassicsGUIMod:
                 rap_path = self.require_rap_file(edat_content_id)
             elif encrypted_mode:
                 rap_path = self.find_rap_file(edat_content_id)
+            else:
+                rap_path = self.find_placeholder_rap()
+                if not rap_path:
+                    raise RuntimeError(
+                        "The RAP matching the universal PS2 Classics placeholder "
+                        "Content ID was not found. It is required to create a "
+                        "fresh game-specific ISO.BIN.EDAT payload."
+                    )
 
             enc_path = usrdir / "ISO.BIN.ENC"
             edat_path = usrdir / "ISO.BIN.EDAT"
@@ -5962,33 +6206,16 @@ class PS2ClassicsGUIMod:
                         "was skipped because metadata or a tool was unavailable."
                     )
             else:
-                if individual_mode:
-                    edat_path, expected_game_id, edat_info = self.create_iso_bin_edat(
-                        make_npdata=make_npdata,
-                        rap_path=rap_path,
-                        disc_id=disc_id,
-                        content_id=edat_content_id,
-                        klic_bin_path=klic_bin_path,
-                        usrdir=usrdir,
-                        work_dir=work_dir,
-                    )
-                    self.set_progress(28)
-                else:
-                    if not edat_path.is_file():
-                        raise RuntimeError(
-                            "The original PS2 Classics GUI placeholder "
-                            "ISO.BIN.EDAT is missing from PS2U10000/USRDIR."
-                        )
-                    edat_info = self.verify_iso_bin_edat_header(
-                        edat_path,
-                        edat_content_id,
-                        expected_game_id,
-                    )
-                    self.log(
-                        "Reusing the original placeholder ISO.BIN.EDAT; "
-                        "make_npdata.exe and RAP are not required."
-                    )
-                    self.set_progress(28)
+                edat_path, expected_game_id, edat_info = self.create_iso_bin_edat(
+                    make_npdata=make_npdata,
+                    rap_path=rap_path,
+                    disc_id=disc_id,
+                    content_id=edat_content_id,
+                    klic_bin_path=klic_bin_path,
+                    usrdir=usrdir,
+                    work_dir=work_dir,
+                )
+                self.set_progress(28)
 
                 encrypt_input = source_path
                 if self.add_limg.get():
@@ -6027,19 +6254,28 @@ class PS2ClassicsGUIMod:
             )
             self.set_progress(55)
 
-            # Visible field selection; an empty field keeps the technical template asset.
-            if not self.copy_resolved_asset(
-                "ICON0.PNG",
-                self.icon0_path.get().strip(),
-                package_dir / "ICON0.PNG",
-            ):
+            # Use the asset paths frozen at build start. A selected custom asset
+            # must never silently fall back to the PS2U10000 template.
+            icon0_source = asset_sources.get("ICON0.PNG")
+            if icon0_source:
+                if not self.copy_resolved_asset(
+                    "ICON0.PNG",
+                    str(icon0_source),
+                    package_dir / "ICON0.PNG",
+                ):
+                    raise RuntimeError("The selected ICON0.PNG could not be copied.")
+            else:
+                template_icon = package_dir / "ICON0.PNG"
+                if not template_icon.is_file():
+                    raise RuntimeError("ICON0.PNG is required by the package.")
+                self.validate_package_image_asset("ICON0.PNG", template_icon)
                 self.log("ICON0.PNG kept from the package template.")
 
-            pic1_text = self.pic1_path.get().strip()
-            if pic1_text:
+            pic1_source = asset_sources.get("PIC1.PNG")
+            if pic1_source:
                 if not self.copy_resolved_asset(
                     "PIC1.PNG",
-                    pic1_text,
+                    str(pic1_source),
                     package_dir / "PIC1.PNG",
                 ):
                     raise RuntimeError("The selected PIC1.PNG could not be copied.")
@@ -6047,11 +6283,11 @@ class PS2ClassicsGUIMod:
                 (package_dir / "PIC1.PNG").unlink(missing_ok=True)
                 self.log("PIC1.PNG omitted by user choice.")
 
-            pic0_text = self.pic0_path.get().strip()
-            if pic0_text:
+            pic0_source = asset_sources.get("PIC0.PNG")
+            if pic0_source:
                 if not self.copy_resolved_asset(
                     "PIC0.PNG",
-                    pic0_text,
+                    str(pic0_source),
                     package_dir / "PIC0.PNG",
                 ):
                     raise RuntimeError("The selected PIC0.PNG could not be copied.")
@@ -6196,6 +6432,7 @@ class PS2ClassicsGUIMod:
                 package_content_id=content_id,
                 edat_content_id=edat_content_id,
                 expected_title_id=package_title_id,
+                expected_title=self.game_title.get().strip(),
                 expected_version=version,
                 expected_game_id=expected_game_id,
                 make_npdata=make_npdata,

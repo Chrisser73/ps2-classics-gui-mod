@@ -7,9 +7,10 @@
 <p align="center">
   A modern Python/Tkinter front-end for PS2 Classics GUI v2.2.3, with a live
   XMB preview, automatic metadata and image-type detection, CONFIG updates,
-  local compatibility data, per-game PKG identities, local key handling and a
-  Windows EXE builder.
+  local compatibility data, QoL improvements and a Windows EXE builder.
 </p>
+
+#### Why?
 
 The original Visual Basic 5 front-end can crash on modern Windows systems
 while selecting or processing files. This project replaces only that legacy
@@ -18,28 +19,19 @@ the user.
 
 ## Features
 
-- Live PS3 XMB-style preview with clickable ICON0, PIC0, PIC1 and game-title areas.
-- Automatic game metadata and disc-ID detection.
-- Automatic image-type detection for 2048-byte DVD and 2352-byte CD/BIN images,
-  with manual override still available.
-- Automatic PS2 CONFIG lookup by disc ID.
-- **Update Configs** downloads the current webMAN-MOD CONFIG archive and updates
-  the local `CONFIGS` folder with determinate 0-100% progress.
-- **Re-scan Configs** checks the selected game again after an update or local
-  CONFIG change.
-- Local PS2 Classics compatibility cache with region-aware status display and
-  expandable compatibility notes.
-- Optional PSXDataCenter title-map refresh for improved disc-ID to title matching.
-- Automatic local `ps2.key` detection, restoration/generation from available
-  local original-package data, validation and reuse.
-- Raw ISO/BIN encryption and existing ISO.BIN.ENC packaging workflows.
-- Optional game-specific EDAT workflow when the required local files are available.
-- Per-game PKG identity and install directory derived from the detected disc ID,
-  so standalone builds no longer reuse the shared `PS2U10000` install identity.
-- Extended post-build verification for PKG identity, `TITLE_ID`, `CATEGORY`,
-  `BOOTABLE`, version, EDAT and encrypted image content.
-- Collapsible build-readiness and process-log sections with responsive progress.
-- Normalized PKG filenames using the game title and detected disc ID.
+- Live XMB-style preview with clickable ICON0, PIC0, PIC1 and game-title areas.
+- Automatic ICON0, PIC0 and PIC1 normalization from JPG/PNG sources. Images keep their aspect ratio, are centered on transparent 320x176, 1000x560 and 1920x1080 canvases.
+- Automatic metadata, ID and image-type detection for DVD/CD.
+- Automatic CONFIG lookup and insertion by ID.
+- **Update Configs** downloads the current CONFIG archive into the existing local `CONFIGS` folder.
+- **Re-scan Configs** checks the selected game again after an update or local CONFIG change.
+- Local PS2 Classics compatibility cache with expandable compatibility notes.
+- Optional title-map refresh for improved ID to title matching.
+- Automatic detection and restoration/generation of required local files.
+- Collapsible build-readiness panel showing missing requirements.
+- Options for retaining build artifacts for inspection.
+- Extended post-build verification.
+- Collapsible process-log section.
 - Integrated PyInstaller production build through `build.bat`.
 
 ## Preview
@@ -51,7 +43,7 @@ the user.
 ### Requirements
 
 - Windows 10 or Windows 11
-- [PS2 Classics GUI v2.2.3 by Aldo Vargas](https://www.psx-place.com/resources/ps2-classics-gui.638/)
+- PS2 Classics GUI v2.2.3 by Aldo Vargas from psx-place
 - Python 3 with Tkinter and Tcl/Tk
 - Pillow
 - PyInstaller only when building the EXE
@@ -65,17 +57,17 @@ py -3 -m pip install --upgrade Pillow PyInstaller
 ### Installation
 
 1. Download and extract the original `ps2classics_GUI_2.2.3` package.
-2. Copy these files into the root of that folder:
+2. Copy these files into the root of that folder (and keep the original package files and folders in place):
    - `ps2_classics_gui_mod.py`
    - `start.bat`
-   - `build.bat`
-   - `app.ico`
-   - `app.png`
-   - `comp_cache.db`
-3. Keep the original package files and folders in place.
+3. (optional)
+   - `build.bat` (build .exe)
+   - `app.ico` (for .exe build)
+   - `app.png` (for .exe build)
+   - `comp_cache.db` (compatibility check)
 
 The mod automatically detects and reuses the locally installed tools,
-templates, CONFIG files, covers and key files.
+templates, CONFIG files, covers and so on...
 
 ## How to run
 
@@ -90,9 +82,6 @@ or:
 ```bat
 py -3 ps2_classics_gui_mod.py
 ```
-
-The normal workflow is handled through the GUI. No terminal commands are
-required for package creation.
 
 ## Building the Windows EXE
 
@@ -112,38 +101,38 @@ _build\
 Copy the generated EXE from `_build` into the root of
 `ps2classics_GUI_2.2.3` before using it normally.
 
-The EXE includes Python, Tkinter and Pillow. The original PS2 Classics GUI
-toolchain remains external and must still be present in the same installation.
-
-## Notes
-
-- The GUI searches the original installation for the files required by each
-  workflow.
-- Missing requirements are shown in the collapsible build-readiness panel.
-- A matching PS2 CONFIG is inserted automatically when one is found.
-- CONFIG updates are written into the existing local `CONFIGS` folder.
-- Compatibility information is read from the local `comp_cache.db` and is
-  informational only; it does not block a build.
-- Standard standalone builds use a game-specific `TITLE_ID` and PKG install
-  identity derived from the detected disc ID instead of installing every game
-  as `PS2U10000`.
-- The original PS2 Classics placeholder identity can still be used internally
-  where required by the legacy encryption/EDAT workflow.
-- Existing local key material can be detected, restored to the project root,
-  validated and reused automatically.
-- The application does not store machine-specific paths in a settings file.
+The original toolchain remains external and must still be present in the same installation.
 
 ## Legal notice
 
-This repository contains only the replacement front-end, its own assets,
-documentation and build scripts. It does not provide the original toolchain
-or third-party/proprietary content.
+## Legal notice
 
-This is an unofficial community project and is not affiliated with or
-endorsed by Sony Interactive Entertainment, Aldo Vargas or the authors of the
-external tools it can call.
+This repository contains an independently developed replacement front-end and
+only includes its own source code, assets, documentation and build scripts.
 
-Use the software only with content, backups, tools, keys and licenses that you
-are legally authorized to use. This project is not intended for piracy or
-unlawful circumvention, and the author expressly distances himself from such
-use.
+It does **not** contain, redistribute or provide:
+
+- Source code copied from the original PS2 Classics GUI or other third-party software.
+- Decompiled, disassembled or otherwise extracted proprietary code.
+- Proprietary binaries, executables, libraries or components from the original toolchain.
+- Copyrighted files.
+- Protected material.
+- Proprietary templates, assets or resources belonging to third parties.
+
+The project is designed only to provide a replacement user interface and to
+interoperate with tools and files that the user supplies separately and is
+legally authorized to use.
+
+References to PlayStation, PS2, PS3, PS2 Classics, Sony, Aldo Vargas or other
+third-party products and projects are used only for identification,
+compatibility and interoperability purposes. No ownership of third-party
+names, trademarks, software or assets is claimed.
+
+This is an unofficial community project and is not affiliated with, sponsored
+by or endorsed by Sony Interactive Entertainment, Aldo Vargas or the authors
+of any external tools it can use.
+
+Users are responsible for obtaining and using any external software, game content, and other files legally. This project is not intended to facilitate piracy, copyright infringement or unlawful circumvention of technological protection measures.
+
+If you believe that material in this repository infringes your rights, please
+contact the repository owner so the matter can be reviewed and addressed.
