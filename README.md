@@ -7,7 +7,8 @@
 <p align="center">
   A modern Python/Tkinter front-end for PS2 Classics GUI v2.2.3, with a live
   XMB preview, automatic metadata and image-type detection, CONFIG updates,
-  PSDevWiki compatibility lookup, local key handling and a Windows EXE builder.
+  local compatibility data, per-game PKG identities, local key handling and a
+  Windows EXE builder.
 </p>
 
 The original Visual Basic 5 front-end can crash on modern Windows systems
@@ -22,18 +23,21 @@ the user.
 - Automatic image-type detection for 2048-byte DVD and 2352-byte CD/BIN images,
   with manual override still available.
 - Automatic PS2 CONFIG lookup by disc ID.
-- **Update Configs** downloads the latest PS2 CONFIG collection from webMAN-MOD
-  into the local `CONFIGS` folder while keeping the expected subfolder layout.
+- **Update Configs** downloads the current webMAN-MOD CONFIG archive and updates
+  the local `CONFIGS` folder with determinate 0-100% progress.
 - **Re-scan Configs** checks the selected game again after an update or local
   CONFIG change.
-- PSDevWiki PS2 Classics compatibility lookup with region-aware status display.
-- Expandable **Notes** section for compatibility notes when available.
-- Local compatibility cache so the last downloaded list remains usable if the
-  website is temporarily unavailable.
+- Local PS2 Classics compatibility cache with region-aware status display and
+  expandable compatibility notes.
+- Optional PSXDataCenter title-map refresh for improved disc-ID to title matching.
 - Automatic local `ps2.key` detection, restoration/generation from available
   local original-package data, validation and reuse.
 - Raw ISO/BIN encryption and existing ISO.BIN.ENC packaging workflows.
 - Optional game-specific EDAT workflow when the required local files are available.
+- Per-game PKG identity and install directory derived from the detected disc ID,
+  so standalone builds no longer reuse the shared `PS2U10000` install identity.
+- Extended post-build verification for PKG identity, `TITLE_ID`, `CATEGORY`,
+  `BOOTABLE`, version, EDAT and encrypted image content.
 - Collapsible build-readiness and process-log sections with responsive progress.
 - Normalized PKG filenames using the game title and detected disc ID.
 - Integrated PyInstaller production build through `build.bat`.
@@ -67,6 +71,7 @@ py -3 -m pip install --upgrade Pillow PyInstaller
    - `build.bat`
    - `app.ico`
    - `app.png`
+   - `comp_cache.db`
 3. Keep the original package files and folders in place.
 
 The mod automatically detects and reuses the locally installed tools,
@@ -117,7 +122,13 @@ toolchain remains external and must still be present in the same installation.
 - Missing requirements are shown in the collapsible build-readiness panel.
 - A matching PS2 CONFIG is inserted automatically when one is found.
 - CONFIG updates are written into the existing local `CONFIGS` folder.
-- Compatibility information is informational only and does not block a build.
+- Compatibility information is read from the local `comp_cache.db` and is
+  informational only; it does not block a build.
+- Standard standalone builds use a game-specific `TITLE_ID` and PKG install
+  identity derived from the detected disc ID instead of installing every game
+  as `PS2U10000`.
+- The original PS2 Classics placeholder identity can still be used internally
+  where required by the legacy encryption/EDAT workflow.
 - Existing local key material can be detected, restored to the project root,
   validated and reused automatically.
 - The application does not store machine-specific paths in a settings file.

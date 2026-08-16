@@ -149,7 +149,7 @@ class _DataCenterListParser(HTMLParser):
 
 
 class PS2ClassicsGUIMod:
-    APP_VERSION = "0.10.4"
+    APP_VERSION = "0.10.5"
     APP_NAME = "PS2 Classics GUI - Mod by Chrisser"
     APP_ID = "Chrisser.PS2ClassicsGUIMod"
     EMPTY_PACKAGE_KLICENSEE = "0" * 32
@@ -902,8 +902,8 @@ class PS2ClassicsGUIMod:
         tk.Label(
             source_frame,
             text=(
-                "Off: reuse the placeholder EDAT. "
-                "On: create an EDAT using a local matching RAP."
+                "Off: use the universal placeholder EDAT/key inside a separate game PKG. "
+                "On: create a per-game EDAT using a local matching RAP."
             ),
             fg=self.COLOR_DESCRIPTION_DARK,
             bg=self.COLOR_BG,
@@ -1132,7 +1132,7 @@ class PS2ClassicsGUIMod:
 
         pkg_frame = self.create_group("PKG metadata · populated automatically")
         self.add_text_row(pkg_frame, "Game title", self.game_title, required=True)
-        self.add_text_row(pkg_frame, "Content ID", self.content_id, required=True)
+        self.add_text_row(pkg_frame, "Package Content ID", self.content_id, required=True)
         self.add_text_row(pkg_frame, "Title ID", self.title_id, required=True)
         self.add_text_row(pkg_frame, "Version", self.version, required=True)
         self.add_text_row(
@@ -3152,10 +3152,11 @@ class PS2ClassicsGUIMod:
         return compact[:9]
 
     def generated_content_id(self, disc_id, title_id):
-        """Create a deterministic custom Content ID from discovered metadata."""
-        seed = f"{disc_id}|{title_id}".encode("utf-8")
-        suffix = hashlib.sha256(seed).hexdigest()[:16].upper()
-        return f"2P0001-{title_id}_00-{suffix}"
+        """Create a stable per-game package Content ID."""
+        title_id = re.sub(r"[^A-Z0-9]", "", str(title_id).upper())[:9]
+        if len(title_id) != 9:
+            return ""
+        return f"2P0001-{title_id}_00-PS2CLASSICS00000"
 
     @staticmethod
     def clean_title_from_path(path):
@@ -3329,6 +3330,8 @@ class PS2ClassicsGUIMod:
                     disc_id = self.decrypt_edat_for_metadata(edat, content_id)
                 except Exception as error:
                     self.log(f"EDAT metadata warning: {error}")
+            if not disc_id:
+                disc_id = self.detect_disc_id(source)
         else:
             disc_id = self.detect_disc_id(source)
 
@@ -3349,24 +3352,39 @@ class PS2ClassicsGUIMod:
                 title = self.clean_title_from_path(source)
 
         if encrypted_mode:
-            title_id = str(sfo_values.get("TITLE_ID", "")).strip().upper()
-            if not title_id and content_id:
-                title_id = self.content_id_title_id(content_id) or ""
+            edat_content_id = content_id
+            title_id = self.compact_disc_title_id(disc_id) if disc_id else ""
+            if not title_id:
+                nearby_title_id = str(
+                    sfo_values.get("TITLE_ID", "")
+                ).strip().upper()
+                if nearby_title_id and nearby_title_id != "PS2U10000":
+                    title_id = nearby_title_id
+            if not title_id and edat_content_id:
+                candidate_title_id = self.content_id_title_id(edat_content_id) or ""
+                if candidate_title_id != "PS2U10000":
+                    title_id = candidate_title_id
             version = str(
                 sfo_values.get("VERSION")
                 or sfo_values.get("APP_VER")
                 or "01.00"
             ).strip()
-        elif individual_mode:
-            title_id = self.compact_disc_title_id(disc_id) if disc_id else ""
-            version = "01.00"
-            if title_id and disc_id:
-                content_id = self.generated_content_id(disc_id, title_id)
+            content_id = (
+                self.generated_content_id(disc_id, title_id)
+                if title_id
+                else ""
+            )
         else:
+            title_id = self.compact_disc_title_id(disc_id) if disc_id else ""
             placeholder = self.get_placeholder_identity()
-            content_id = placeholder.get("content_id", "")
-            title_id = placeholder.get("title_id", "")
-            version = placeholder.get("version", "01.00")
+            version = str(
+                sfo_values.get("VERSION")
+                or sfo_values.get("APP_VER")
+                or placeholder.get("version")
+                or "01.00"
+            ).strip()
+            if title_id:
+                content_id = self.generated_content_id(disc_id, title_id)
 
         if title:
             self.game_title.set(title)
@@ -4045,18 +4063,16 @@ class PS2ClassicsGUIMod:
                     (
                         f"individual EDAT via {make_npdata or 'missing make_npdata.exe'}"
                         if individual_mode
-                        else str(placeholder_edat or "placeholder EDAT missing")
+                        else (
+                            "universal placeholder EDAT: "
+                            + str(placeholder_edat or "missing")
+                        )
                     ),
                 )
             )
 
         content_ok = self.valid_content_id(content_id)
         content_details = content_id or "not discovered/generated"
-        if not encrypted_mode and not individual_mode and placeholder:
-            placeholder_cid = placeholder.get("content_id", "")
-            content_ok = content_ok and content_id == placeholder_cid
-            if content_id != placeholder_cid:
-                content_details = f"must match placeholder: {placeholder_cid}"
 
         requirements.extend(
             [
@@ -4074,7 +4090,7 @@ class PS2ClassicsGUIMod:
                     bool(self.game_title.get().strip()),
                     self.game_title.get().strip() or "not discovered",
                 ),
-                ("Content ID", content_ok, content_details),
+                ("Package Content ID", content_ok, content_details),
                 (
                     "Title ID",
                     bool(expected_title_id) and title_id == expected_title_id,
@@ -5321,7 +5337,8 @@ class PS2ClassicsGUIMod:
         self,
         pkg_path,
         package_dir,
-        content_id,
+        package_content_id,
+        edat_content_id,
         expected_title_id,
         expected_version,
         expected_game_id,
@@ -5344,11 +5361,18 @@ class PS2ClassicsGUIMod:
         verify_dir.mkdir(parents=True)
         pkg_info = self.read_pkg_index(pkg_path)
 
-        if pkg_info["content_id"] != content_id:
+        if pkg_info["content_id"] != package_content_id:
             raise RuntimeError(
                 "The PKG header Content ID does not match.\n"
-                f"Expected: {content_id}\n"
-                f"Gefunden: {pkg_info['content_id']}"
+                f"Expected: {package_content_id}\n"
+                f"Found: {pkg_info['content_id']}"
+            )
+
+        if package_dir.name.upper() != expected_title_id.upper():
+            raise RuntimeError(
+                "The package install directory does not match TITLE_ID.\n"
+                f"Directory: {package_dir.name}\n"
+                f"TITLE_ID: {expected_title_id}"
             )
 
         entry_map = {
@@ -5424,6 +5448,7 @@ class PS2ClassicsGUIMod:
         expected_sfo = {
             "TITLE_ID": expected_title_id,
             "CATEGORY": "2P",
+            "BOOTABLE": "1",
             "VERSION": expected_version,
         }
 
@@ -5438,7 +5463,7 @@ class PS2ClassicsGUIMod:
 
         self.verify_iso_bin_edat_header(
             extracted["USRDIR/ISO.BIN.EDAT"],
-            content_id,
+            edat_content_id,
             expected_game_id,
         )
 
@@ -5466,10 +5491,13 @@ class PS2ClassicsGUIMod:
             "=============================",
             f"PKG: {pkg_path}",
             f"PKG SHA-256: {self.sha256_file(pkg_path)}",
-            f"Content ID: {pkg_info['content_id']}",
+            f"Package Content ID: {pkg_info['content_id']}",
+            f"EDAT/ENC Content ID: {edat_content_id}",
+            f"Install directory: {package_dir.name}",
             f"Entries: {pkg_info['item_count']}",
             f"TITLE_ID: {sfo_values.get('TITLE_ID')}",
             f"CATEGORY: {sfo_values.get('CATEGORY')}",
+            f"BOOTABLE: {sfo_values.get('BOOTABLE')}",
             f"VERSION: {sfo_values.get('VERSION')}",
             f"EDAT Payload: {expected_game_id or 'not decrypted'}",
             f"ISO.BIN.ENC size: {enc_entry['file_size']}",
@@ -5496,7 +5524,9 @@ class PS2ClassicsGUIMod:
         self.log(
             "Finished PKG reopened and verified:"
         )
-        self.log(f"  Content ID: {pkg_info['content_id']}")
+        self.log(f"  Package Content ID: {pkg_info['content_id']}")
+        self.log(f"  EDAT/ENC Content ID: {edat_content_id}")
+        self.log(f"  Install directory: {package_dir.name}")
         self.log(f"  PARAM.SFO: {expected_sfo}")
         self.log(f"  EDAT Payload: {expected_game_id or 'not decrypted'}")
         self.log(f"  Verification report: {report_path}")
@@ -5798,10 +5828,45 @@ class PS2ClassicsGUIMod:
                     )
                 )
             )
+            package_title_id = (
+                self.content_id_title_id(content_id)
+                or self.title_id.get().strip().upper()
+            )
+            if not package_title_id:
+                raise RuntimeError("The Title ID could not be determined.")
+            if package_title_id == "PS2U10000" and disc_id:
+                raise RuntimeError(
+                    "The package still resolves to the shared PS2U10000 placeholder. "
+                    "Re-select the source image so a game-specific Title ID can be generated."
+                )
+
+            if encrypted_mode:
+                sidecar_for_identity = self.find_sidecar_edat(source_path)
+                if not sidecar_for_identity:
+                    raise RuntimeError(
+                        "ISO.BIN.EDAT was not found for the selected ISO.BIN.ENC."
+                    )
+                edat_content_id = self.read_edat_basic_info(
+                    sidecar_for_identity
+                )["content_id"].strip().upper()
+            elif individual_mode:
+                edat_content_id = content_id
+            else:
+                placeholder_identity = self.get_placeholder_identity()
+                edat_content_id = str(
+                    placeholder_identity.get("content_id", "")
+                ).strip().upper()
+                if not self.valid_content_id(edat_content_id):
+                    raise RuntimeError(
+                        "The universal placeholder Content ID could not be read "
+                        "from PS2U10000/USRDIR/ISO.BIN.EDAT."
+                    )
+
             self.log(f"Source: {source_path}")
             self.log(f"Disc ID: {disc_id or 'not decrypted'}")
-            self.log(f"Content ID: {content_id}")
-            self.log(f"Title ID: {self.title_id.get().strip().upper()}")
+            self.log(f"Package Content ID: {content_id}")
+            self.log(f"EDAT/ENC Content ID: {edat_content_id}")
+            self.log(f"Install Title ID: {package_title_id}")
             self.log(f"PKG tool: {pkg_tool}")
             self.log(f"Template: {template_dir}")
 
@@ -5811,7 +5876,7 @@ class PS2ClassicsGUIMod:
                     dir=str(output_dir),
                 )
             )
-            package_dir = work_dir / "package"
+            package_dir = work_dir / package_title_id
             usrdir = package_dir / "USRDIR"
 
             shutil.copytree(
@@ -5821,14 +5886,8 @@ class PS2ClassicsGUIMod:
             )
             usrdir.mkdir(parents=True, exist_ok=True)
             self.log(f"Working folder: {work_dir}")
+            self.log(f"Install directory: {package_dir.name}")
             self.set_progress(7)
-
-            package_title_id = (
-                self.content_id_title_id(content_id)
-                or self.title_id.get().strip().upper()
-            )
-            if not package_title_id:
-                raise RuntimeError("The Title ID could not be determined.")
 
             self.title_id.set(package_title_id)
             param_sfo = package_dir / "PARAM.SFO"
@@ -5855,9 +5914,9 @@ class PS2ClassicsGUIMod:
 
             rap_path = None
             if individual_mode:
-                rap_path = self.require_rap_file(content_id)
+                rap_path = self.require_rap_file(edat_content_id)
             elif encrypted_mode:
-                rap_path = self.find_rap_file(content_id)
+                rap_path = self.find_rap_file(edat_content_id)
 
             enc_path = usrdir / "ISO.BIN.ENC"
             edat_path = usrdir / "ISO.BIN.EDAT"
@@ -5882,7 +5941,7 @@ class PS2ClassicsGUIMod:
 
                 edat_info = self.verify_iso_bin_edat_header(
                     edat_path,
-                    content_id,
+                    edat_content_id,
                     expected_game_id,
                 )
 
@@ -5908,7 +5967,7 @@ class PS2ClassicsGUIMod:
                         make_npdata=make_npdata,
                         rap_path=rap_path,
                         disc_id=disc_id,
-                        content_id=content_id,
+                        content_id=edat_content_id,
                         klic_bin_path=klic_bin_path,
                         usrdir=usrdir,
                         work_dir=work_dir,
@@ -5922,7 +5981,7 @@ class PS2ClassicsGUIMod:
                         )
                     edat_info = self.verify_iso_bin_edat_header(
                         edat_path,
-                        content_id,
+                        edat_content_id,
                         expected_game_id,
                     )
                     self.log(
@@ -5951,7 +6010,7 @@ class PS2ClassicsGUIMod:
                         encrypt_input,
                         enc_path,
                         "ISO.BIN.ENC",
-                        content_id,
+                        edat_content_id,
                     ],
                     self.script_dir,
                     stage="Encrypting PS2 image to ISO.BIN.ENC",
@@ -6016,7 +6075,7 @@ class PS2ClassicsGUIMod:
                 ps2classic=ps2classic,
                 target=target,
                 key_path=key_path,
-                content_id=content_id,
+                content_id=edat_content_id,
                 iso_path=source_path,
                 usrdir=usrdir,
                 disc_id_override=disc_id,
@@ -6134,7 +6193,8 @@ class PS2ClassicsGUIMod:
             report_path = self.verify_finished_pkg(
                 pkg_path=final_pkg,
                 package_dir=package_dir,
-                content_id=content_id,
+                package_content_id=content_id,
+                edat_content_id=edat_content_id,
                 expected_title_id=package_title_id,
                 expected_version=version,
                 expected_game_id=expected_game_id,
@@ -6159,7 +6219,7 @@ class PS2ClassicsGUIMod:
                 if rap_path and Path(rap_path).is_file():
                     exdata_output = output_dir / "exdata"
                     exdata_output.mkdir(exist_ok=True)
-                    rap_output = exdata_output / f"{content_id}.rap"
+                    rap_output = exdata_output / f"{edat_content_id}.rap"
                     if rap_output.exists():
                         rap_output.unlink()
                     shutil.copy2(rap_path, rap_output)
