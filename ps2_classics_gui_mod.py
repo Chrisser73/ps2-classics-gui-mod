@@ -19,6 +19,11 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -149,7 +154,7 @@ class _DataCenterListParser(HTMLParser):
 
 
 class PS2ClassicsGUIMod:
-    APP_VERSION = "1.0.0"
+    APP_VERSION = "1.1.1"
     APP_NAME = "PS2 Classics GUI - Mod by Chrisser"
     APP_ID = "Chrisser.PS2ClassicsGUIMod"
     EMPTY_PACKAGE_KLICENSEE = "0" * 32
@@ -165,6 +170,22 @@ class PS2ClassicsGUIMod:
         "https://github.com/aldostools/webMAN-MOD/archive/refs/heads/master.zip",
     )
     CONFIG_ARCHIVE_PATH = "_Projects_/updater/PS2CONFIG/USRDIR/CONFIG/"
+    CONFIG_GITHUB_API_ROOT = (
+        "https://api.github.com/repos/aldostools/webMAN-MOD/contents/"
+        "_Projects_/updater/PS2CONFIG/USRDIR/CONFIG"
+    )
+    AT3_PLAYER_REPO_URL = "https://github.com/BenMitnicK/AT9-AT3_Converter"
+    AT3_PLAYER_DOWNLOAD_URLS = (
+        (
+            "https://cdn.jsdelivr.net/gh/BenMitnicK/AT9-AT3_Converter@master/"
+            "at3-at9_Converter/PLAYER/MiniPlayer.exe"
+        ),
+        (
+            "https://raw.githubusercontent.com/BenMitnicK/AT9-AT3_Converter/"
+            "master/at3-at9_Converter/PLAYER/MiniPlayer.exe"
+        ),
+    )
+    ENCRYPT_SFO_SUFFIX = ".PARAM.SFO"
     DATACENTER_URLS = {
         "PAL-EU": "https://psxdatacenter.com/psx2/plist2.html",
         "NTSC-U": "https://psxdatacenter.com/psx2/ulist2.html",
@@ -172,6 +193,10 @@ class PS2ClassicsGUIMod:
     }
 
     COMPATIBILITY_CACHE_FILE = "comp_cache.db"
+    COMPATIBILITY_SOURCE_URL = (
+        "https://www.psdevwiki.com/ps3/"
+        "PS2_Classics_Emulator_Compatibility_List"
+    )
     COMPATIBILITY_LOCAL_HTML_NAMES = (
         "PS2 Classics Emulator Compatibility List - PS3 Developer wiki.html",
         "PS2_Classics_Emulator_Compatibility_List.html",
@@ -270,6 +295,8 @@ class PS2ClassicsGUIMod:
         self.auto_image_type_path = None
         self.config_update_running = False
         self.config_update_queue = queue.Queue()
+        self.config_rescan_running = False
+        self.config_rescan_queue = queue.Queue()
         self.compatibility_queue = queue.Queue()
         self.compatibility_after_id = None
         self.compatibility_request_id = 0
@@ -282,15 +309,38 @@ class PS2ClassicsGUIMod:
         self.compatibility_source_override = None
         self._source_refresh_after_id = None
         self._last_source_refresh_path = None
+        self._pending_source_refresh_path = None
+        self._source_metadata_ready_path = None
+        self.source_metadata_queue = queue.Queue()
+        self.source_metadata_request_id = 0
+        self.source_metadata_loading = False
+        self.compatibility_db_lock = threading.RLock()
+        self._tool_cache = {}
+        self._asset_candidate_cache = {}
+        self.audio_preview_process = None
+        self.audio_preview_muted = True
+        self.audio_preview_poll_after_id = None
+        self._ffplay_checked = False
+        self._ffplay_path = None
+        self._ffmpeg_checked = False
+        self._ffmpeg_path = None
+        self._miniplayer_path = None
+        self.player_download_running = False
+        self.player_download_queue = queue.Queue()
+        self.audio_preview_queue = queue.Queue()
+        self.audio_preview_temp_wav = None
+        self.audio_preview_request_id = 0
 
         # Build source
-        self.input_mode = tk.StringVar(value="raw")
+        self.input_mode = tk.StringVar(value="package")
         self.iso_path = tk.StringVar()
         self.edat_source_path = tk.StringVar()
         self.detected_disc_id = tk.StringVar()
         self.create_verification_report = tk.BooleanVar(value=False)
         self.create_individual_edat = tk.BooleanVar(value=False)
         self.keep_encrypted_artifacts = tk.BooleanVar(value=False)
+        self.encrypt_only_create_edat = tk.BooleanVar(value=True)
+        self.encrypt_only_copy_rap = tk.BooleanVar(value=False)
         self.status_text = tk.StringVar(value="Ready")
         self.config_update_status = tk.StringVar(value="")
         self.compatibility_status = tk.StringVar(value="Not checked")
@@ -337,8 +387,12 @@ class PS2ClassicsGUIMod:
         self.load_existing_tools()
         self.root.after(100, self.update_live_preview)
         self.root.after(150, self.poll_config_update_queue)
+        self.root.after(120, self.poll_config_rescan_queue)
         self.root.after(150, self.poll_compatibility_queue)
         self.root.after(150, self.poll_compat_cache_queue)
+        self.root.after(120, self.poll_source_metadata_queue)
+        self.root.after(120, self.poll_audio_preview_queue)
+        self.root.after(150, self.poll_player_download_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # -------------------------------------------------------
@@ -363,6 +417,7 @@ class PS2ClassicsGUIMod:
 
     def on_close(self):
         self.stop_compatibility_spinner()
+        self.stop_audio_preview()
         self.root.destroy()
 
     @staticmethod
@@ -658,6 +713,8 @@ class PS2ClassicsGUIMod:
 
         if not root_value:
             self.ps2_key_required = True
+            if hasattr(self, "set_key_expanded"):
+                self.set_key_expanded(True)
             if not self.create_project_ps2_key.get():
                 self.create_project_ps2_key.set(True)
             self.ps2_key_checkbox.configure(
@@ -802,6 +859,7 @@ class PS2ClassicsGUIMod:
             ),
         )
         left_canvas.configure(yscrollcommand=left_scroll.set)
+        self.left_canvas = left_canvas
 
         left_canvas.pack(side="left", fill="both", expand=True)
         left_scroll.pack(side="right", fill="y")
@@ -828,6 +886,14 @@ class PS2ClassicsGUIMod:
             highlightthickness=1,
         )
         self.preview_canvas.pack()
+        self.audio_preview_button = tk.Button(
+            self.preview_canvas,
+            text="Choose SND0",
+            command=self.audio_preview_button_action,
+            font=self.FONT_SMALL,
+            padx=5,
+            pady=1,
+        )
         self.preview_canvas.bind("<Button-1>", self.on_preview_click)
         self.preview_canvas.bind("<Motion>", self.on_preview_motion)
         self.preview_canvas.bind(
@@ -846,7 +912,58 @@ class PS2ClassicsGUIMod:
         )
         self.preview_info.pack(fill="x", pady=(8, 0))
 
-        github_link = tk.Label(
+        self.audio_player_hint_frame = tk.Frame(
+            right,
+            bg=self.COLOR_BG,
+        )
+        self.audio_player_hint_label = tk.Label(
+            self.audio_player_hint_frame,
+            text=(
+                "No AT3 preview player detected. "
+                "Copy MiniPlayer.exe to <app root>\\player."
+            ),
+            fg=self.COLOR_DESCRIPTION,
+            bg=self.COLOR_BG,
+            font=self.FONT_SMALL,
+            anchor="w",
+            justify="left",
+            wraplength=345,
+        )
+        self.audio_player_hint_label.pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+
+        self.audio_player_download_slot = tk.Frame(
+            self.audio_player_hint_frame,
+            bg=self.COLOR_BG,
+            width=105,
+            height=22,
+        )
+        self.audio_player_download_slot.pack(side="right", padx=(6, 0))
+        self.audio_player_download_slot.pack_propagate(False)
+
+        self.audio_player_download_button = tk.Button(
+            self.audio_player_download_slot,
+            text="Download player",
+            command=self.download_at3_player,
+            padx=5,
+            pady=0,
+            font=self.FONT_SMALL,
+        )
+        self.audio_player_download_button.pack(fill="both", expand=True)
+
+        self.audio_player_download_progress = ttk.Progressbar(
+            self.audio_player_download_slot,
+            mode="indeterminate",
+        )
+
+        # Show this immediately when no preview backend is available. It is
+        # hidden automatically by the first preview refresh when a player exists.
+        self.audio_player_hint_frame.pack(fill="x", pady=(5, 0))
+
+        self.github_link = tk.Label(
             right,
             text="github.com/Chrisser73",
             fg=self.COLOR_LINK,
@@ -854,8 +971,8 @@ class PS2ClassicsGUIMod:
             cursor="hand2",
             font=("Segoe UI", 9, "underline"),
         )
-        github_link.pack(pady=(14, 0))
-        github_link.bind(
+        self.github_link.pack(pady=(14, 0))
+        self.github_link.bind(
             "<Button-1>",
             lambda _event: webbrowser.open_new_tab(
                 "https://github.com/Chrisser73"
@@ -866,9 +983,9 @@ class PS2ClassicsGUIMod:
 
         tk.Radiobutton(
             source_frame,
-            text="Raw PS2 ISO / BIN (encrypt during this build)",
+            text="Build PKG from ISO / BIN / ISO.BIN.ENC",
             variable=self.input_mode,
-            value="raw",
+            value="package",
             command=self.change_input_mode,
             fg=self.COLOR_TEXT_SOFT,
             bg=self.COLOR_BG,
@@ -879,22 +996,53 @@ class PS2ClassicsGUIMod:
 
         tk.Radiobutton(
             source_frame,
-            text="Existing ISO.BIN.ENC (package without re-encrypting)",
+            text="Just encrypt ISO / BIN to ISO.BIN.ENC",
             variable=self.input_mode,
-            value="encrypted",
+            value="encrypt_only",
             command=self.change_input_mode,
             fg=self.COLOR_TEXT_SOFT,
             bg=self.COLOR_BG,
             selectcolor=self.COLOR_PANEL_ACTIVE,
             activebackground=self.COLOR_BG,
             activeforeground=self.COLOR_TEXT,
-        ).pack(anchor="w", padx=9, pady=(1, 5))
+        ).pack(anchor="w", padx=9, pady=(1, 2))
+
+        self.encrypt_only_options = tk.Frame(source_frame, bg=self.COLOR_BG)
+        tk.Checkbutton(
+            self.encrypt_only_options,
+            text="Create matching ISO.BIN.EDAT",
+            variable=self.encrypt_only_create_edat,
+            command=self.schedule_build_readiness,
+            fg=self.COLOR_TEXT_SOFT,
+            bg=self.COLOR_BG,
+            selectcolor=self.COLOR_PANEL_ACTIVE,
+            activebackground=self.COLOR_BG,
+            activeforeground=self.COLOR_TEXT,
+        ).pack(anchor="w", padx=28, pady=(2, 1))
+        tk.Checkbutton(
+            self.encrypt_only_options,
+            text="Copy matching RAP",
+            variable=self.encrypt_only_copy_rap,
+            command=self.schedule_build_readiness,
+            fg=self.COLOR_TEXT_SOFT,
+            bg=self.COLOR_BG,
+            selectcolor=self.COLOR_PANEL_ACTIVE,
+            activebackground=self.COLOR_BG,
+            activeforeground=self.COLOR_TEXT,
+        ).pack(anchor="w", padx=28, pady=(1, 4))
+
+        experimental_frame, self.set_experimental_edat_expanded = (
+            self.create_collapsible_section(
+                source_frame,
+                "Experimental",
+                expanded=False,
+            )
+        )
+        self.experimental_edat_outer = experimental_frame.master
 
         self.individual_edat_checkbox = tk.Checkbutton(
-            source_frame,
-            text=(
-                "Use a custom game-specific EDAT identity"
-            ),
+            experimental_frame,
+            text="Use a custom game-specific EDAT identity",
             variable=self.create_individual_edat,
             command=self.change_identity_mode,
             fg=self.COLOR_TEXT_SOFT,
@@ -905,12 +1053,12 @@ class PS2ClassicsGUIMod:
         )
         self.individual_edat_checkbox.pack(
             anchor="w",
-            padx=28,
-            pady=(2, 2),
+            padx=9,
+            pady=(6, 2),
         )
 
         tk.Label(
-            source_frame,
+            experimental_frame,
             text=(
                 "Off: create a fresh game EDAT with the universal PS2 Classics identity. "
                 "On: use the package Content ID and a matching RAP."
@@ -919,34 +1067,70 @@ class PS2ClassicsGUIMod:
             bg=self.COLOR_BG,
             justify="left",
             anchor="w",
-            wraplength=515,
+            wraplength=500,
             font=self.FONT_SMALL,
-        ).pack(fill="x", padx=(46, 10), pady=(0, 5))
+        ).pack(fill="x", padx=(27, 10), pady=(0, 7))
 
-        self.add_file_row(
+        source_io_frame = self.create_group("Source & output")
+        self.source_io_frame = source_io_frame
+
+        self.add_file_row_to_parent(
+            source_io_frame,
             "Source image",
-            (
-                "Raw image or an existing ISO.BIN.ENC."
-            ),
+            "",
             self.iso_path,
             self.browse_iso,
             required=True,
         )
-
-        compatibility_frame = tk.Frame(self.form_frame, bg=self.COLOR_BG)
-        compatibility_frame.pack(
-            fill="x",
-            padx=(0, 8),
-            pady=(5, 0),
+        self.add_file_row_to_parent(
+            source_io_frame,
+            "Output folder",
+            "",
+            self.output_dir,
+            self.browse_output,
+            required=True,
         )
 
-        tk.Label(
-            compatibility_frame,
-            text="Compatibility",
-            fg=self.COLOR_TEXT,
+        self.compatibility_container = tk.Frame(
+            source_io_frame,
             bg=self.COLOR_BG,
-            font=self.FONT_BOLD,
-        ).pack(side="left")
+        )
+        self.compatibility_container.pack(
+            fill="x",
+            padx=9,
+            pady=(8, 0),
+        )
+
+        compatibility_frame = tk.Frame(
+            self.compatibility_container,
+            bg=self.COLOR_BG,
+        )
+        compatibility_frame.pack(fill="x")
+
+        self.compat_check_slot = tk.Frame(
+            compatibility_frame,
+            bg=self.COLOR_BG,
+            width=126,
+            height=24,
+        )
+        self.compat_check_slot.pack(side="left")
+        self.compat_check_slot.pack_propagate(False)
+
+        self.compat_check_button = tk.Button(
+            self.compat_check_slot,
+            text="Check compatibility",
+            command=self.schedule_compatibility_check,
+            padx=6,
+            pady=1,
+            font=self.FONT_SMALL,
+            state=tk.DISABLED,
+        )
+        self.compat_check_button.pack(fill="both", expand=True)
+
+        self.compat_source_progress = ttk.Progressbar(
+            self.compat_check_slot,
+            mode="indeterminate",
+        )
 
         self.compatibility_status_label = tk.Label(
             compatibility_frame,
@@ -961,34 +1145,32 @@ class PS2ClassicsGUIMod:
 
         self.compat_cache_button = tk.Button(
             compatibility_frame,
-            text="Get cache",
+            text="Rebuild cache",
             command=self.refresh_compatibility_cache,
-            width=9,
+            width=12,
             padx=2,
             pady=0,
             font=self.FONT_SMALL,
         )
         self.compat_cache_button.pack(side="right")
-        self.update_compat_cache_button()
 
         self.compatibility_match_label = tk.Label(
-            self.form_frame,
+            self.compatibility_container,
             textvariable=self.compatibility_match,
             fg=self.COLOR_DESCRIPTION,
             bg=self.COLOR_BG,
             justify="left",
             anchor="w",
-            wraplength=540,
+            wraplength=520,
             font=self.FONT_SMALL,
         )
         self.compatibility_match_label.pack(
             fill="x",
-            padx=(0, 8),
             pady=(2, 0),
         )
 
         self.compatibility_notes_button = tk.Button(
-            self.form_frame,
+            self.compatibility_container,
             text="Notes",
             command=self.toggle_compatibility_notes,
             anchor="w",
@@ -1004,72 +1186,115 @@ class PS2ClassicsGUIMod:
             padx=0,
             pady=0,
         )
-        self.compatibility_notes_button.pack(
-            fill="x",
-            padx=(0, 8),
-            pady=(1, 0),
+        self.compatibility_notes_container = tk.Frame(
+            self.compatibility_container,
+            bg=self.COLOR_BG,
         )
 
         self.compatibility_notes_label = tk.Label(
-            self.form_frame,
+            self.compatibility_notes_container,
             textvariable=self.compatibility_notes,
             fg=self.COLOR_DESCRIPTION,
             bg=self.COLOR_BG,
             justify="left",
             anchor="w",
-            wraplength=540,
+            wraplength=510,
             font=self.FONT_SMALL,
         )
 
-        self.add_file_row(
-            "ISO.BIN.EDAT sidecar",
-            (
-                "Matching EDAT for an existing encrypted image."
-            ),
+        self.package_inputs_group = self.create_group(
+            "Package inputs"
+        )
+
+        self.edat_sidecar_container = tk.Frame(
+            self.package_inputs_group,
+            bg=self.COLOR_BG,
+        )
+        self.edat_sidecar_container.pack(fill="x")
+        self.add_file_row_to_parent(
+            self.edat_sidecar_container,
+            "ISO.BIN.EDAT",
+            "Required for an encrypted image; a matching EDAT next to the ENC is used automatically.",
             self.edat_source_path,
             self.browse_edat_source,
+            required=True,
         )
-        self.add_file_row(
+
+        self.package_assets_container = tk.Frame(
+            self.package_inputs_group,
+            bg=self.COLOR_BG,
+        )
+        self.package_assets_container.pack(fill="x")
+
+        self.add_file_row_to_parent(
+            self.package_assets_container,
             "ICON0.PNG",
-            (
-                "XMB icon. A fallback path is filled automatically."
-            ),
+            "XMB icon.",
             self.icon0_path,
             self.browse_icon0,
             required=False,
         )
-        self.add_file_row(
+        self.add_file_row_to_parent(
+            self.package_assets_container,
             "PIC1.PNG",
             "XMB background image.",
             self.pic1_path,
             self.browse_pic1,
         )
-        self.add_file_row(
+        self.add_file_row_to_parent(
+            self.package_assets_container,
             "PIC0.PNG",
             "Full XMB information panel.",
             self.pic0_path,
             self.browse_pic0,
         )
-        self.add_file_row(
+        self.add_file_row_to_parent(
+            self.package_assets_container,
             "SND0.AT3",
             "Music played while the game is selected.",
             self.snd0_path,
             self.browse_snd0,
         )
-        self.add_file_row(
+        self.add_file_row_to_parent(
+            self.package_assets_container,
             "PS2 CONFIG",
-            (
-                "Emulator config; searched automatically by disc ID."
-            ),
+            "Emulator config; searched automatically by disc ID.",
             self.param_hip_path,
             self.browse_param_hip,
         )
 
-        config_actions = tk.Frame(self.form_frame, bg=self.COLOR_BG)
+        config_actions = tk.Frame(
+            self.package_assets_container,
+            bg=self.COLOR_BG,
+        )
         config_actions.pack(
             fill="x",
-            padx=(0, 8),
+            padx=(9, 8),
             pady=(4, 0),
+        )
+
+        self.config_rescan_slot = tk.Frame(
+            config_actions,
+            bg=self.COLOR_BG,
+            width=96,
+            height=24,
+        )
+        self.config_rescan_slot.pack(side="left")
+        self.config_rescan_slot.pack_propagate(False)
+
+        self.rescan_configs_button = tk.Button(
+            self.config_rescan_slot,
+            text="Re-scan configs",
+            command=self.rescan_configs,
+            padx=4,
+            pady=0,
+            font=self.FONT_SMALL,
+        )
+        self.rescan_configs_button.pack(fill="both", expand=True)
+
+        self.config_rescan_progress = ttk.Progressbar(
+            self.config_rescan_slot,
+            mode="indeterminate",
         )
 
         self.config_update_slot = tk.Frame(
@@ -1078,7 +1303,7 @@ class PS2ClassicsGUIMod:
             width=92,
             height=24,
         )
-        self.config_update_slot.pack(side="left")
+        self.config_update_slot.pack(side="left", padx=(5, 0))
         self.config_update_slot.pack_propagate(False)
 
         self.update_configs_button = tk.Button(
@@ -1102,73 +1327,115 @@ class PS2ClassicsGUIMod:
         )
         self.config_update_progress.pack(fill="both", expand=True)
 
-        self.rescan_configs_button = tk.Button(
-            config_actions,
-            text="Re-scan configs",
-            command=self.rescan_configs,
-            padx=4,
-            pady=2,
-            font=self.FONT_SMALL,
-        )
-        self.rescan_configs_button.pack(side="left", padx=(5, 0))
-
         tk.Label(
-            self.form_frame,
+            self.package_assets_container,
             textvariable=self.config_update_status,
             fg=self.COLOR_DESCRIPTION,
             bg=self.COLOR_BG,
             justify="left",
             anchor="w",
-            wraplength=540,
+            wraplength=520,
             font=self.FONT_SMALL,
-        ).pack(fill="x", padx=(0, 8), pady=(2, 0))
+        ).pack(fill="x", padx=(9, 8), pady=(2, 0))
 
-        self.add_file_row(
-            "make_npdata.exe (auto-detected)",
-            (
-                "Required only for game-specific EDAT mode."
-            ),
-            self.make_npdata_path,
-            self.browse_make_npdata,
-            required=False,
+        make_npdata_frame, self.set_make_npdata_expanded = (
+            self.create_collapsible_section(
+                self.package_assets_container,
+                "make_npdata.exe",
+                expanded=False,
+            )
         )
-        self.add_file_row(
-            "Output folder",
-            "Destination for the finished PKG and kept files.",
-            self.output_dir,
-            self.browse_output,
+        self.make_npdata_outer = make_npdata_frame.master
+
+        make_npdata_row = tk.Frame(make_npdata_frame, bg=self.COLOR_BG)
+        make_npdata_row.pack(fill="x", padx=(9, 8), pady=(7, 2))
+        self.make_entry(make_npdata_row, self.make_npdata_path).pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+        tk.Button(
+            make_npdata_row,
+            text="…",
+            command=self.browse_make_npdata,
+            width=4,
+        ).pack(side="left", padx=(5, 0))
+        tk.Button(
+            make_npdata_row,
+            text="×",
+            command=lambda: self.clear_field(self.make_npdata_path),
+            width=3,
+        ).pack(side="left", padx=(3, 0))
+        self.make_description_label(
+            make_npdata_frame,
+            "Optional helper used when ISO.BIN.EDAT files are created or verified.",
+            wraplength=520,
+            padx=(9, 8),
+            pady=(0, 7),
+        )
+
+        self.pkg_frame = self.create_group(
+            "PKG metadata"
+        )
+        self.pkg_title_label = self.add_text_row(
+            self.pkg_frame,
+            "Game title",
+            self.game_title,
             required=True,
         )
-
-        pkg_frame = self.create_group("PKG metadata · populated automatically")
-        self.add_text_row(pkg_frame, "Game title", self.game_title, required=True)
-        self.add_text_row(pkg_frame, "Package Content ID", self.content_id, required=True)
-        self.add_text_row(pkg_frame, "Title ID", self.title_id, required=True)
-        self.add_text_row(pkg_frame, "Version", self.version, required=True)
+        self.pkg_content_id_label = self.add_text_row(
+            self.pkg_frame,
+            "Package Content ID",
+            self.content_id,
+            required=True,
+        )
+        self.pkg_title_id_label = self.add_text_row(
+            self.pkg_frame,
+            "Title ID",
+            self.title_id,
+            required=True,
+        )
+        self.pkg_version_label = self.add_text_row(
+            self.pkg_frame,
+            "Version",
+            self.version,
+            required=True,
+        )
         self.add_text_row(
-            pkg_frame,
+            self.pkg_frame,
             "Detected disc ID",
             self.detected_disc_id,
-            description=(
-                "Read from the selected image or EDAT."
-            ),
+            description="Read from the selected image or EDAT.",
         )
 
-        encrypt_frame = self.create_group("Encryption options from PS2 Classics GUI")
+        self.encrypt_frame = self.create_group(
+            "Encryption options from PS2 Classics GUI"
+        )
+        encrypt_frame = self.encrypt_frame
 
-        self.add_text_row(
+        key_frame, self.set_key_expanded = self.create_collapsible_section(
             encrypt_frame,
-            "Klicensee",
-            self.klicensee,
-            description=(
-                "Loaded from ps2.key or generated from the local placeholder RAP."
-            ),
-            required=True,
+            "Klicensee *",
+            expanded=self.ps2_key_required,
+        )
+        self.key_outer = key_frame.master
+
+        self.make_entry(key_frame, self.klicensee).pack(
+            fill="x",
+            padx=10,
+            pady=(7, 1),
+        )
+        self.make_description_label(
+            key_frame,
+            "Loaded from ps2.key or generated from the local placeholder RAP.",
+            wraplength=520,
+            padx=(10, 10),
+            pady=(1, 2),
         )
 
         self.ps2_key_checkbox = tk.Checkbutton(
-            encrypt_frame,
-            text="Create or replace the root ps2.key during the build",
+            key_frame,
+            text="Create or replace the root ps2.key",
             variable=self.create_project_ps2_key,
             command=self.on_ps2_key_option_changed,
             fg=self.COLOR_TEXT_SOFT,
@@ -1186,24 +1453,25 @@ class PS2ClassicsGUIMod:
         )
 
         self.ps2_key_status_label = tk.Label(
-            encrypt_frame,
+            key_frame,
             textvariable=self.ps2_key_status,
             fg=self.COLOR_DESCRIPTION_DARK,
             bg=self.COLOR_BG,
             justify="left",
             anchor="w",
-            wraplength=550,
+            wraplength=520,
             font=self.FONT_SMALL,
         )
         self.ps2_key_status_label.pack(
             fill="x",
             anchor="w",
             padx=(28, 10),
-            pady=(0, 4),
+            pady=(0, 6),
         )
         self.update_ps2_key_option_ui()
 
         option_grid = tk.Frame(encrypt_frame, bg=self.COLOR_BG)
+        self.encrypt_option_grid = option_grid
         option_grid.pack(fill="x", padx=9, pady=(6, 9))
         option_grid.columnconfigure(0, weight=1)
         option_grid.columnconfigure(1, weight=1)
@@ -1299,10 +1567,15 @@ class PS2ClassicsGUIMod:
             font=self.FONT_SMALL,
         ).pack(anchor="w", padx=28, pady=(0, 7))
 
-        vmc_frame = self.create_group("VMC / VME")
+        vmc_frame, self.set_vmc_expanded = self.create_collapsible_section(
+            self.form_frame,
+            "VMC / VME",
+            expanded=False,
+        )
+        self.vmc_outer = vmc_frame.master
         tk.Checkbutton(
             vmc_frame,
-            text="Encrypt a VMC to VME during the build",
+            text="Encrypt a VMC to VME",
             variable=self.encrypt_vmc,
             command=self.update_vmc_state,
             fg=self.COLOR_TEXT_SOFT,
@@ -1313,7 +1586,7 @@ class PS2ClassicsGUIMod:
         ).pack(anchor="w", padx=9, pady=(5, 2))
 
         self.vmc_controls = tk.Frame(vmc_frame, bg=self.COLOR_BG)
-        self.vmc_controls.pack(fill="x", padx=9, pady=(0, 8))
+        self.vmc_controls.pack(fill="x", padx=0, pady=(0, 8))
 
         self.add_file_row_to_parent(
             self.vmc_controls,
@@ -1332,7 +1605,8 @@ class PS2ClassicsGUIMod:
         self.update_vmc_state()
         self.individual_edat_checkbox.configure(state=tk.NORMAL)
 
-        verification_frame = self.create_group("Post-build verification")
+        self.verification_frame = self.create_group("Post-build verification")
+        verification_frame = self.verification_frame
         verification_grid = tk.Frame(verification_frame, bg=self.COLOR_BG)
         verification_grid.pack(fill="x", padx=8, pady=(5, 8))
         verification_grid.columnconfigure(0, weight=1, uniform="verify")
@@ -1343,7 +1617,7 @@ class PS2ClassicsGUIMod:
         verification_right = tk.Frame(verification_grid, bg=self.COLOR_BG)
         verification_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        tk.Checkbutton(
+        self.verification_report_checkbox = tk.Checkbutton(
             verification_left,
             text="Keep a structural <PKG>_verification folder",
             variable=self.create_verification_report,
@@ -1355,7 +1629,8 @@ class PS2ClassicsGUIMod:
             anchor="w",
             justify="left",
             wraplength=255,
-        ).pack(fill="x", anchor="w")
+        )
+        self.verification_report_checkbox.pack(fill="x", anchor="w")
         self.make_description_label(
             verification_left,
             "Keeps extracted files and verification.txt.",
@@ -1364,7 +1639,7 @@ class PS2ClassicsGUIMod:
             pady=(2, 0),
         )
 
-        tk.Checkbutton(
+        self.keep_artifacts_checkbox = tk.Checkbutton(
             verification_right,
             text="Keep ISO.BIN.ENC, ISO.BIN.EDAT and RAP",
             variable=self.keep_encrypted_artifacts,
@@ -1376,7 +1651,8 @@ class PS2ClassicsGUIMod:
             anchor="w",
             justify="left",
             wraplength=255,
-        ).pack(fill="x", anchor="w")
+        )
+        self.keep_artifacts_checkbox.pack(fill="x", anchor="w")
         self.make_description_label(
             verification_right,
             "Keeps reusable encrypted files in the output folder.",
@@ -1388,10 +1664,11 @@ class PS2ClassicsGUIMod:
         readiness_frame, self.set_readiness_expanded = (
             self.create_collapsible_section(
                 self.form_frame,
-                "Build readiness · required fields are marked with *",
+                "Check log · required fields are marked with *",
                 expanded=False,
             )
         )
+        self.readiness_outer = readiness_frame.master
 
         self.readiness_label = tk.Label(
             readiness_frame,
@@ -1412,7 +1689,7 @@ class PS2ClassicsGUIMod:
         tk.Label(
             readiness_frame,
             text=(
-                "MAKE PKG is enabled when every requirement reports OK."
+                "The action button is enabled when every requirement reports OK."
             ),
             fg=self.COLOR_DESCRIPTION_DARK,
             bg=self.COLOR_BG,
@@ -1489,7 +1766,11 @@ class PS2ClassicsGUIMod:
 
         self.game_title.trace_add(
             "write",
-            lambda *_args: self.schedule_compatibility_check(),
+            lambda *_args: self.reset_compatibility_display(),
+        )
+        self.snd0_path.trace_add(
+            "write",
+            lambda *_args: self.on_snd0_changed(),
         )
 
         for variable in (
@@ -1508,6 +1789,8 @@ class PS2ClassicsGUIMod:
             self.input_mode,
             self.create_individual_edat,
             self.keep_encrypted_artifacts,
+            self.encrypt_only_create_edat,
+            self.encrypt_only_copy_rap,
             self.icon0_path,
             self.pic0_path,
             self.pic1_path,
@@ -1533,7 +1816,7 @@ class PS2ClassicsGUIMod:
         )
         self.iso_path.trace_add(
             "write",
-            lambda *_args: self.schedule_compatibility_check(),
+            lambda *_args: self.reset_compatibility_display(),
         )
         self.iso_path.trace_add(
             "write",
@@ -1541,6 +1824,7 @@ class PS2ClassicsGUIMod:
         )
 
         self._readiness_after_id = None
+        self.update_source_mode_ui()
         self.update_encrypt_option_state()
         self.root.after(150, self.update_build_readiness)
 
@@ -1665,23 +1949,26 @@ class PS2ClassicsGUIMod:
         command,
         required=False,
     ):
-        tk.Label(
+        title_label = tk.Label(
             parent,
             text=title + ("  *" if required else ""),
             fg=self.COLOR_TEXT,
             bg=self.COLOR_BG,
             font=self.FONT_BOLD,
-        ).pack(anchor="w", padx=(0, 8), pady=(7, 0))
-
-        self.make_description_label(
-            parent,
-            description,
-            wraplength=520,
-            padx=(0, 8),
         )
+        title_label.pack(anchor="w", padx=(9, 8), pady=(7, 0))
+
+        description_label = None
+        if description:
+            description_label = self.make_description_label(
+                parent,
+                description,
+                wraplength=520,
+                padx=(9, 8),
+            )
 
         row = tk.Frame(parent, bg=self.COLOR_BG)
-        row.pack(fill="x", padx=(0, 8), pady=(2, 0))
+        row.pack(fill="x", padx=(9, 8), pady=(2, 0))
 
         self.make_entry(row, variable).pack(
             side="left",
@@ -1701,6 +1988,12 @@ class PS2ClassicsGUIMod:
             width=3,
         ).pack(side="left", padx=(3, 0))
 
+        return {
+            "title_label": title_label,
+            "description_label": description_label,
+            "row": row,
+        }
+
     def add_text_row(
         self,
         parent,
@@ -1712,14 +2005,15 @@ class PS2ClassicsGUIMod:
         row = tk.Frame(parent, bg=self.COLOR_BG)
         row.pack(fill="x", padx=9, pady=(5, 0))
 
-        tk.Label(
+        title_label = tk.Label(
             row,
             text=title + ("  *" if required else ""),
             width=16,
             anchor="w",
             fg=self.COLOR_TEXT_MUTED,
             bg=self.COLOR_BG,
-        ).pack(side="left")
+        )
+        title_label.pack(side="left")
 
         self.make_entry(row, variable).pack(
             side="left",
@@ -1736,55 +2030,179 @@ class PS2ClassicsGUIMod:
                 pady=(1, 0),
             )
 
+        return title_label
+
+    def source_is_encrypted(self, source=None):
+        source_text = source or self.iso_path.get().strip()
+        if not source_text:
+            return False
+        name = Path(source_text).name.lower()
+        return name.endswith(".enc")
+
+    def update_source_mode_ui(self):
+        package_mode = self.input_mode.get() == "package"
+        encrypt_only_mode = self.input_mode.get() == "encrypt_only"
+        encrypted_source = package_mode and self.source_is_encrypted()
+
+        if encrypt_only_mode:
+            if not self.encrypt_only_options.winfo_manager():
+                self.encrypt_only_options.pack(
+                    fill="x",
+                    pady=(0, 2),
+                    before=self.experimental_edat_outer,
+                )
+        else:
+            self.encrypt_only_options.pack_forget()
+
+        # Compatibility is meaningful only for packaged games.
+        if package_mode:
+            if not self.compatibility_container.winfo_manager():
+                self.compatibility_container.pack(
+                    fill="x",
+                    padx=9,
+                    pady=(8, 0),
+                )
+        else:
+            self.hide_source_metadata_loading()
+            self.compatibility_container.pack_forget()
+
+        # Post-build verification and VMC/VME are package-build features.
+        if hasattr(self, "vmc_outer"):
+            if package_mode:
+                if not self.vmc_outer.winfo_manager():
+                    before_widget = (
+                        self.verification_frame
+                        if self.verification_frame.winfo_manager()
+                        else self.readiness_outer
+                    )
+                    self.vmc_outer.pack(
+                        fill="x",
+                        padx=(0, 8),
+                        pady=(10, 0),
+                        before=before_widget,
+                    )
+            else:
+                self.encrypt_vmc.set(False)
+                self.vmc_outer.pack_forget()
+
+        if hasattr(self, "verification_frame"):
+            if package_mode:
+                if not self.verification_frame.winfo_manager():
+                    before_widget = (
+                        self.readiness_outer
+                        if hasattr(self, "readiness_outer")
+                        else self.progress
+                    )
+                    self.verification_frame.pack(
+                        fill="x",
+                        padx=(0, 8),
+                        pady=(10, 0),
+                        before=before_widget,
+                    )
+            else:
+                self.verification_frame.pack_forget()
+
+        if package_mode:
+            if not self.package_inputs_group.winfo_manager():
+                self.package_inputs_group.pack(
+                    fill="x",
+                    padx=(0, 8),
+                    pady=(10, 0),
+                    before=self.encrypt_frame,
+                )
+            if not self.pkg_frame.winfo_manager():
+                self.pkg_frame.pack(
+                    fill="x",
+                    padx=(0, 8),
+                    pady=(10, 0),
+                    before=self.encrypt_frame,
+                )
+        else:
+            self.package_inputs_group.pack_forget()
+            self.pkg_frame.pack_forget()
+
+        if encrypted_source:
+            if not self.edat_sidecar_container.winfo_manager():
+                self.edat_sidecar_container.pack(
+                    fill="x",
+                    before=self.package_assets_container,
+                )
+        else:
+            self.edat_sidecar_container.pack_forget()
+
+        if package_mode and not encrypted_source:
+            self.individual_edat_checkbox.configure(state=tk.NORMAL)
+        else:
+            self.create_individual_edat.set(False)
+            self.individual_edat_checkbox.configure(state=tk.DISABLED)
+
+        # In Just encrypt mode the key is normally resolved automatically.
+        # Keep the editor visible only if there is no usable key source.
+        if hasattr(self, "key_outer"):
+            valid_field = bool(
+                re.fullmatch(
+                    r"[0-9A-Fa-f]{32}",
+                    self.normalize_klicensee(self.klicensee.get()),
+                )
+            )
+            automatic_key_available = bool(
+                self.valid_ps2_key_file()
+                or valid_field
+                or (
+                    getattr(self, "ps2_key_source_file", None)
+                    and Path(self.ps2_key_source_file).is_file()
+                )
+                or self.get_ps2_key_generation_source()
+            )
+            show_key_ui = package_mode or not automatic_key_available
+            if show_key_ui:
+                if not self.key_outer.winfo_manager():
+                    self.key_outer.pack(
+                        fill="x",
+                        before=self.encrypt_option_grid,
+                    )
+            else:
+                self.key_outer.pack_forget()
+
+        required = package_mode
+        for label, title in (
+            (self.pkg_title_label, "Game title"),
+            (self.pkg_content_id_label, "Package Content ID"),
+            (self.pkg_title_id_label, "Title ID"),
+            (self.pkg_version_label, "Version"),
+        ):
+            label.configure(text=title + ("  *" if required else ""))
+
+        self.pkg_frame.configure(text="PKG metadata")
+
     def update_encrypt_option_state(self):
-        """Enable raw-image options only when raw encryption is selected."""
+        """Keep media type manually selectable while gating raw-only LIMG work."""
         has_source = bool(self.iso_path.get().strip())
-        raw_mode = self.input_mode.get() == "raw"
+        encrypted_source = self.source_is_encrypted()
+        raw_source = has_source and not encrypted_source
 
-        image_state = tk.NORMAL if has_source and raw_mode else tk.DISABLED
-        target_state = tk.NORMAL if has_source else tk.DISABLED
-
+        # Image Type is always a manual override, including existing ENC files.
         for button in self.image_type_buttons:
-            button.configure(state=image_state)
+            button.configure(state=tk.NORMAL)
 
+        target_state = tk.NORMAL if has_source else tk.DISABLED
         for button in self.target_type_buttons:
             button.configure(state=target_state)
 
-        self.limg_checkbox.configure(state=image_state)
+        self.limg_checkbox.configure(
+            state=(tk.NORMAL if raw_source else tk.DISABLED)
+        )
 
     def change_input_mode(self):
-        self.iso_path.set("")
-        self.edat_source_path.set("")
-        self.detected_disc_id.set("")
-        self.game_title.set("")
-        self.content_id.set("")
-        self.title_id.set("")
-        self.version.set("")
-        self.disc_id_cache_path = None
-        self.disc_id_cache_value = None
-        self.auto_image_type_path = None
-        self.image_type_detection.set("")
-        self.reset_compatibility_display()
-
-        if (
-            self.auto_config_path
-            and self.param_hip_path.get().strip() == self.auto_config_path
-        ):
-            self.param_hip_path.set("")
-        self.auto_config_path = ""
-
-        encrypted_mode = self.input_mode.get() == "encrypted"
-        if encrypted_mode:
-            self.create_individual_edat.set(False)
-            self.individual_edat_checkbox.configure(state=tk.DISABLED)
-        else:
-            self.individual_edat_checkbox.configure(state=tk.NORMAL)
-
+        self.update_source_mode_ui()
         self.update_encrypt_option_state()
-        self.update_build_readiness()
+        self.reset_compatibility_display()
+        if self.iso_path.get().strip():
+            self.schedule_source_dependent_refresh()
+        self.schedule_build_readiness()
 
     def change_identity_mode(self):
-        if self.input_mode.get() == "encrypted":
+        if self.input_mode.get() != "package" or self.source_is_encrypted():
             self.create_individual_edat.set(False)
             return
 
@@ -1829,36 +2247,45 @@ class PS2ClassicsGUIMod:
         return None
 
     def browse_iso(self):
-        encrypted_mode = self.input_mode.get() == "encrypted"
-
-        if encrypted_mode:
-            title = "Select an existing ISO.BIN.ENC"
-            filetypes = [
-                ("Encrypted PS2 image", "*.ENC *.enc"),
-                ("ISO.BIN.ENC", "ISO.BIN.ENC"),
-                ("All files", "*.*"),
-            ]
-        else:
-            title = "Select a raw PS2 ISO or BIN image"
-            filetypes = [
-                ("PS2 images", "*.iso *.bin *.img"),
-                ("ISO", "*.iso"),
-                ("BIN", "*.bin"),
-                ("All files", "*.*"),
-            ]
-
         filename = filedialog.askopenfilename(
-            title=title,
+            title="Select a PS2 ISO, BIN or encrypted image",
             initialdir=self.get_initial_dir("source"),
-            filetypes=filetypes,
+            filetypes=[
+                ("PS2 image files", "*.iso *.bin *.img *.enc"),
+                ("All files", "*.*"),
+            ],
         )
 
         if filename:
             self.iso_path.set(filename)
             self.remember_path("source", filename)
-            self.refresh_source_dependent_data(force=True)
 
     def schedule_source_dependent_refresh(self):
+        source_text = self.iso_path.get().strip()
+
+        if source_text != self._pending_source_refresh_path:
+            self._pending_source_refresh_path = source_text
+            self.source_metadata_request_id += 1
+            self._source_metadata_ready_path = None
+            self.reset_compatibility_display()
+
+            self.disc_id_cache_path = None
+            self.disc_id_cache_value = None
+            self.detected_disc_id.set("")
+            self.auto_config_path = ""
+            self.param_hip_path.set("")
+            self.edat_source_path.set("")
+
+            if self.input_mode.get() == "package":
+                self.game_title.set("")
+                self.content_id.set("")
+                self.title_id.set("")
+                self.version.set("01.00")
+
+            if hasattr(self, "compat_check_button"):
+                self.compat_check_button.configure(state=tk.DISABLED)
+                self.show_source_metadata_loading()
+
         if self._source_refresh_after_id is not None:
             try:
                 self.root.after_cancel(self._source_refresh_after_id)
@@ -1866,9 +2293,502 @@ class PS2ClassicsGUIMod:
                 pass
 
         self._source_refresh_after_id = self.root.after(
-            300,
+            120,
             self.refresh_source_dependent_data,
         )
+
+    @staticmethod
+    def find_sidecar_edat_for_source(source, selected_text=""):
+        if selected_text:
+            selected = Path(selected_text)
+            if selected.is_file():
+                return selected
+
+        source_path = Path(source)
+        candidates = [
+            source_path.with_suffix(".EDAT"),
+            source_path.parent / "ISO.BIN.EDAT",
+            source_path.with_name("ISO.BIN.EDAT"),
+            source_path.parent.parent / "USRDIR" / "ISO.BIN.EDAT",
+            source_path.parent.parent / "ISO.BIN.EDAT",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @classmethod
+    def encrypted_companion_sfo_path(cls, source):
+        """Return the per-game PARAM.SFO stored next to an encrypted image."""
+        source = Path(source)
+        name = source.name
+        lower_name = name.lower()
+
+        if lower_name.endswith(".iso.bin.enc"):
+            base = name[:-len(".ISO.BIN.ENC")]
+        elif lower_name.endswith(".enc"):
+            base = name[:-len(".ENC")]
+        else:
+            base = source.stem
+
+        return source.with_name(base + cls.ENCRYPT_SFO_SUFFIX)
+
+    def create_encrypted_companion_sfo(
+        self,
+        destination,
+        title,
+        title_id,
+        image_type="",
+    ):
+        """Create a PS2 Classics PARAM.SFO companion for an ENC image."""
+        destination = Path(destination)
+        template = self.find_template_dir()
+        template_sfo = template / "PARAM.SFO" if template else None
+
+        if not template_sfo or not template_sfo.is_file():
+            raise RuntimeError(
+                "The PS2U10000 PARAM.SFO template is required to create "
+                "the encrypted-image metadata companion."
+            )
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        try:
+            shutil.copy2(template_sfo, temporary)
+            updates = {
+                "TITLE": str(title or "").strip(),
+                "TITLE_ID": str(title_id or "").strip().upper(),
+            }
+            normalized_image_type = str(image_type or "").strip()
+            if normalized_image_type in {"CD", "DVD5 / DVD9"}:
+                updates["PS2_IMAGE_TYPE"] = normalized_image_type
+
+            self.patch_param_sfo(
+                temporary,
+                updates,
+            )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+        values = self.sfo_to_values(destination)
+        if str(values.get("TITLE", "")).strip() != str(title or "").strip():
+            raise RuntimeError("The companion PARAM.SFO TITLE could not be verified.")
+        if (
+            str(values.get("TITLE_ID", "")).strip().upper()
+            != str(title_id or "").strip().upper()
+        ):
+            raise RuntimeError(
+                "The companion PARAM.SFO TITLE_ID could not be verified."
+            )
+
+        normalized_image_type = str(image_type or "").strip()
+        if normalized_image_type in {"CD", "DVD5 / DVD9"}:
+            if str(values.get("PS2_IMAGE_TYPE", "")).strip() != normalized_image_type:
+                raise RuntimeError(
+                    "The companion PARAM.SFO image type could not be verified."
+                )
+        return destination
+
+    def _find_rap_near_source(self, content_id, source):
+        if not content_id:
+            return None
+
+        rap_name = content_id + ".rap"
+        source_dir = Path(source).parent
+        preferred = (
+            source_dir / rap_name,
+            source_dir / "exdata" / rap_name,
+            source_dir / "EXDATA" / rap_name,
+            self.script_dir / rap_name,
+            self.script_dir / "exdata" / rap_name,
+            self.script_dir / "EXDATA" / rap_name,
+        )
+        for candidate in preferred:
+            try:
+                if candidate.is_file() and candidate.stat().st_size == 16:
+                    return candidate
+            except OSError:
+                continue
+
+        try:
+            for candidate in self.script_dir.rglob("*.rap"):
+                if (
+                    candidate.name.casefold() == rap_name.casefold()
+                    and candidate.is_file()
+                    and candidate.stat().st_size == 16
+                ):
+                    return candidate
+        except OSError:
+            pass
+
+        return None
+
+    def _decrypt_edat_metadata_background(
+        self,
+        edat_path,
+        content_id,
+        source,
+        klic,
+        make_npdata_path,
+    ):
+        if not re.fullmatch(r"[0-9A-Fa-f]{32}", klic or ""):
+            return None
+
+        make_npdata = Path(make_npdata_path) if make_npdata_path else None
+        if not make_npdata or not make_npdata.is_file():
+            return None
+
+        rap_path = self._find_rap_near_source(content_id, source)
+        if not rap_path:
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="ps2_edat_meta_") as temp_name:
+            temp_dir = Path(temp_name)
+            (temp_dir / "klic.bin").write_bytes(bytes.fromhex(klic))
+            output = temp_dir / "ISO.BIN.DAT"
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW
+                if os.name == "nt"
+                else 0
+            )
+            completed = subprocess.run(
+                [
+                    str(make_npdata),
+                    "-v",
+                    "-d",
+                    str(edat_path),
+                    str(output),
+                    "8",
+                    str(rap_path),
+                ],
+                cwd=str(temp_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                check=False,
+            )
+            if completed.returncode != 0 or not output.is_file():
+                return None
+            return self.disc_id_from_edat_payload(output.read_bytes())
+
+    def _build_source_metadata_snapshot(
+        self,
+        source,
+        mode,
+        encrypted_mode,
+        sfo_values,
+        disc_id="",
+        edat_path=None,
+        edat_content_id="",
+    ):
+        """Build visible source metadata from values already available."""
+        companion_title_id = str(
+            sfo_values.get("TITLE_ID", "")
+        ).strip().upper()
+
+        title = str(sfo_values.get("TITLE", "")).strip()
+        if not title:
+            if encrypted_mode and source.parent.name.upper() == "USRDIR":
+                title = source.parent.parent.name
+            else:
+                title = self.clean_title_from_path(source)
+
+        version = str(
+            sfo_values.get("VERSION")
+            or sfo_values.get("APP_VER")
+            or "01.00"
+        ).strip()
+
+        title_id = ""
+        content_id = ""
+        if mode == "package":
+            title_id = companion_title_id
+
+            if not title_id and disc_id:
+                title_id = self.compact_disc_title_id(disc_id)
+
+            if not title_id and edat_content_id:
+                candidate_title_id = (
+                    self.content_id_title_id(edat_content_id) or ""
+                )
+                if candidate_title_id != "PS2U10000":
+                    title_id = candidate_title_id
+
+            if title_id:
+                content_id = self.generated_content_id(
+                    disc_id,
+                    title_id,
+                )
+
+        stored_image_type = str(
+            sfo_values.get("PS2_IMAGE_TYPE", "")
+        ).strip()
+
+        return {
+            "encrypted": encrypted_mode,
+            "edat": str(edat_path) if edat_path else "",
+            "disc_id": disc_id or "",
+            "title": title,
+            "title_id": title_id,
+            "content_id": content_id,
+            "version": version,
+            "image_type": (
+                stored_image_type
+                if stored_image_type in {"CD", "DVD5 / DVD9"}
+                else ""
+            ),
+        }
+
+    def _source_metadata_worker(
+        self,
+        request_id,
+        source_text,
+        mode,
+        selected_edat,
+        klic,
+        make_npdata_path,
+    ):
+        """Resolve source metadata in phases so visible fields update immediately."""
+        try:
+            source = Path(source_text)
+            encrypted_mode = self.source_is_encrypted(source)
+            sfo_values = self.find_nearby_sfo_values(source)
+
+            # Fast phase: use only nearby companion data, filename information,
+            # and the EDAT header. Do not wait for image scanning, EDAT payload
+            # decryption, CONFIG lookup, or compatibility work before updating UI.
+            companion_title_id = str(
+                sfo_values.get("TITLE_ID", "")
+            ).strip().upper()
+            disc_id = ""
+            if companion_title_id and companion_title_id != "PS2U10000":
+                disc_id = self.normalize_disc_id(companion_title_id) or ""
+            if not disc_id:
+                disc_id = self.normalize_disc_id(source.name) or ""
+
+            edat_path = None
+            edat_content_id = ""
+            if encrypted_mode:
+                edat_path = self.find_sidecar_edat_for_source(
+                    source,
+                    selected_edat,
+                )
+                if edat_path:
+                    try:
+                        info = self.read_edat_basic_info(edat_path)
+                        edat_content_id = info["content_id"].upper()
+                    except Exception:
+                        pass
+
+            quick = self._build_source_metadata_snapshot(
+                source=source,
+                mode=mode,
+                encrypted_mode=encrypted_mode,
+                sfo_values=sfo_values,
+                disc_id=disc_id,
+                edat_path=edat_path,
+                edat_content_id=edat_content_id,
+            )
+            quick["source"] = source_text
+            self.source_metadata_queue.put(
+                ("metadata", request_id, quick)
+            )
+
+            # Slow phase: resolve the real disc ID only if the fast sources did
+            # not already provide it. This remains entirely off the Tk thread.
+            if not disc_id:
+                if encrypted_mode:
+                    if edat_path:
+                        try:
+                            disc_id = self._decrypt_edat_metadata_background(
+                                edat_path,
+                                edat_content_id,
+                                source,
+                                klic,
+                                make_npdata_path,
+                            ) or ""
+                        except Exception:
+                            disc_id = ""
+                    if not disc_id:
+                        disc_id = self.normalize_disc_id(source.name) or ""
+                else:
+                    disc_id = self.detect_disc_id(source) or ""
+
+            resolved = self._build_source_metadata_snapshot(
+                source=source,
+                mode=mode,
+                encrypted_mode=encrypted_mode,
+                sfo_values=sfo_values,
+                disc_id=disc_id,
+                edat_path=edat_path,
+                edat_content_id=edat_content_id,
+            )
+            resolved["source"] = source_text
+            self.source_metadata_queue.put(
+                ("ready", request_id, resolved)
+            )
+
+            # CONFIG lookup is independent of metadata and compatibility. Run it
+            # after publishing the ready event so neither can be held up by a
+            # large CONFIG tree.
+            config_path = self.find_config_for_disc_id(disc_id)
+            self.source_metadata_queue.put(
+                (
+                    "config",
+                    request_id,
+                    {
+                        "source": source_text,
+                        "disc_id": disc_id,
+                        "config": str(config_path) if config_path else "",
+                    },
+                )
+            )
+        except Exception as error:
+            self.source_metadata_queue.put(
+                ("error", request_id, str(error))
+            )
+
+    def _apply_source_metadata_result(self, result):
+        """Apply a metadata snapshot without coupling it to compatibility state."""
+        if result.get("source") != self.iso_path.get().strip():
+            return False
+
+        edat = result.get("edat", "")
+        if edat and self.source_is_encrypted():
+            self.edat_source_path.set(edat)
+
+        disc_id = result.get("disc_id", "")
+        if disc_id:
+            self.detected_disc_id.set(disc_id)
+            try:
+                self.disc_id_cache_path = str(
+                    Path(result["source"]).resolve()
+                )
+            except OSError:
+                self.disc_id_cache_path = result["source"]
+            self.disc_id_cache_value = disc_id
+
+        title = result.get("title", "")
+        if title:
+            self.game_title.set(title)
+
+        restored_image_type = result.get("image_type", "")
+        if restored_image_type in {"CD", "DVD5 / DVD9"}:
+            self.image_type.set(restored_image_type)
+            if result.get("encrypted"):
+                self.image_type_detection.set(
+                    "Detected from companion PARAM.SFO. Manual override allowed."
+                )
+
+        if self.input_mode.get() == "package":
+            if result.get("title_id"):
+                self.title_id.set(result["title_id"])
+            if result.get("content_id"):
+                self.content_id.set(result["content_id"])
+            if result.get("version"):
+                self.version.set(result["version"])
+
+        self.schedule_preview()
+        self.schedule_build_readiness()
+        return True
+
+    def poll_source_metadata_queue(self):
+        try:
+            while True:
+                event = self.source_metadata_queue.get_nowait()
+                event_type, request_id = event[0], event[1]
+                if request_id != self.source_metadata_request_id:
+                    continue
+
+                if event_type == "error":
+                    self.hide_source_metadata_loading()
+                    self.log(f"Source metadata warning: {event[2]}")
+                    if hasattr(self, "compat_check_button"):
+                        self.compat_check_button.configure(state=tk.DISABLED)
+                    continue
+
+                result = event[2]
+                if result.get("source") != self.iso_path.get().strip():
+                    continue
+
+                if event_type == "config":
+                    config = result.get("config", "")
+                    self.auto_config_path = config
+                    if config:
+                        self.param_hip_path.set(config)
+                    self.schedule_build_readiness()
+                    continue
+
+                if event_type not in {"metadata", "ready"}:
+                    continue
+
+                if not self._apply_source_metadata_result(result):
+                    continue
+
+                # Fast metadata is intentionally visible while the ping-pong bar
+                # keeps showing that disc-ID/source analysis is still running.
+                if event_type == "metadata":
+                    continue
+
+                self._source_metadata_ready_path = result["source"]
+                self.hide_source_metadata_loading()
+
+                if (
+                    result.get("encrypted")
+                    and not result.get("image_type")
+                    and self.image_type_detection.get().startswith(
+                        "Reading media type"
+                    )
+                ):
+                    self.image_type_detection.set(
+                        "Encrypted source has no stored media type. Manual selection allowed."
+                    )
+
+                # Give Tk a repaint opportunity before any secondary source
+                # work (asset lookup or compatibility) starts. This makes the
+                # PKG metadata visibly update as soon as it is resolved.
+                try:
+                    self.root.update_idletasks()
+                except tk.TclError:
+                    pass
+
+                if self.input_mode.get() == "package":
+                    try:
+                        self.root.after(
+                            35,
+                            self.populate_default_asset_fields,
+                        )
+                    except tk.TclError:
+                        pass
+
+                auto_check_compatibility = bool(
+                    hasattr(self, "compat_check_button")
+                    and self.input_mode.get() == "package"
+                    and result["source"] == self.iso_path.get().strip()
+                    and not self.compat_cache_running
+                )
+                if auto_check_compatibility:
+                    self.compat_check_button.configure(state=tk.NORMAL)
+
+                # Compatibility is a separate background task. It starts only
+                # after metadata has already been published to the UI and can
+                # never gate or delay the PKG metadata fields.
+                if auto_check_compatibility:
+                    try:
+                        self.root.after(
+                            40,
+                            self.schedule_compatibility_check,
+                        )
+                    except tk.TclError:
+                        pass
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(60, self.poll_source_metadata_queue)
+        except tk.TclError:
+            pass
 
     def refresh_source_dependent_data(self, force=False):
         self._source_refresh_after_id = None
@@ -1877,30 +2797,107 @@ class PS2ClassicsGUIMod:
         if not force and source_text == self._last_source_refresh_path:
             return
 
+        source_changed = source_text != self._last_source_refresh_path
         self._last_source_refresh_path = source_text
+        self._pending_source_refresh_path = source_text
+        self.source_metadata_request_id += 1
+        request_id = self.source_metadata_request_id
+
+        if source_changed:
+            self.edat_source_path.set("")
+
         self.disc_id_cache_path = None
         self.disc_id_cache_value = None
         self.auto_image_type_path = None
         self.auto_config_path = ""
         self.param_hip_path.set("")
+        self.detected_disc_id.set("")
+
+        self.reset_compatibility_display()
+        self.update_source_mode_ui()
+        self.update_encrypt_option_state()
 
         if not source_text or not Path(source_text).is_file():
-            self.detected_disc_id.set("")
             self.image_type_detection.set("")
-            self.reset_compatibility_display()
-            self.update_encrypt_option_state()
+            self.hide_source_metadata_loading()
             self.update_build_readiness()
             return
 
-        if self.input_mode.get() == "encrypted":
-            self.image_type_detection.set("")
-        else:
-            self.auto_detect_image_type(source_text)
+        if self.input_mode.get() == "package":
+            self.show_source_metadata_loading()
 
-        self.auto_populate_metadata()
-        self.populate_config_field(self.detected_disc_id.get().strip())
-        self.schedule_compatibility_check()
-        self.update_encrypt_option_state()
+        if self.source_is_encrypted(source_text):
+            self.image_type_detection.set(
+                "Reading media type from companion PARAM.SFO..."
+            )
+
+            # Matching EDAT discovery is deliberately immediate and independent
+            # from metadata/compatibility work.
+            if not self.edat_source_path.get().strip():
+                immediate_edat = self.find_sidecar_edat_for_source(
+                    source_text,
+                    "",
+                )
+                if immediate_edat:
+                    self.edat_source_path.set(str(immediate_edat))
+        else:
+            # Image-type detection can involve file access. Keep it independent
+            # from PKG metadata population by scheduling it after the metadata
+            # worker has already started.
+            self.image_type_detection.set("Detecting image type...")
+
+        selected_edat = self.edat_source_path.get().strip()
+        klic = self.normalize_klicensee(self.klicensee.get())
+        # Tool discovery is done at startup / on demand. Do not recursively
+        # search the application tree on the source-selection UI path.
+        make_npdata_path = self.make_npdata_path.get().strip()
+
+        worker = threading.Thread(
+            target=self._source_metadata_worker,
+            args=(
+                request_id,
+                source_text,
+                self.input_mode.get(),
+                selected_edat,
+                klic,
+                make_npdata_path,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+        if not self.source_is_encrypted(source_text):
+            def image_type_worker():
+                try:
+                    detected = self.detect_image_type_value(source_text)
+                except Exception:
+                    detected = None
+
+                def apply_image_type():
+                    if request_id != self.source_metadata_request_id:
+                        return
+                    if source_text != self.iso_path.get().strip():
+                        return
+                    if detected:
+                        value, message = detected
+                        self.image_type.set(value)
+                        self.image_type_detection.set(message)
+                    else:
+                        self.image_type_detection.set(
+                            "Sector layout could not be detected automatically."
+                        )
+                    self.schedule_build_readiness()
+
+                try:
+                    self.root.after(0, apply_image_type)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(
+                target=image_type_worker,
+                daemon=True,
+            ).start()
+
         self.update_build_readiness()
 
     def browse_edat_source(self):
@@ -1914,7 +2911,7 @@ class PS2ClassicsGUIMod:
             ],
         )
         if self.edat_source_path.get().strip():
-            self.auto_populate_metadata()
+            self.refresh_source_dependent_data(force=True)
 
     def browse_icon0(self):
         self.choose_image("icon0", self.icon0_path, "Select ICON0")
@@ -2179,17 +3176,114 @@ class PS2ClassicsGUIMod:
 
         return total
 
+    def _download_configs_via_github_api(self):
+        config_root = self.script_dir / "CONFIGS"
+        config_root.mkdir(parents=True, exist_ok=True)
+
+        pending = [("", self.CONFIG_GITHUB_API_ROOT + "?ref=master")]
+        files_to_download = []
+
+        while pending:
+            relative_dir, api_url = pending.pop()
+            entries = self._urlopen_json(api_url, timeout=30)
+            if not isinstance(entries, list):
+                raise RuntimeError(
+                    "GitHub returned an unexpected CONFIG directory response."
+                )
+
+            for entry in entries:
+                entry_type = entry.get("type")
+                name = entry.get("name", "")
+                relative = (
+                    PurePosixPath(relative_dir) / name
+                    if relative_dir
+                    else PurePosixPath(name)
+                )
+
+                if entry_type == "dir":
+                    pending.append(
+                        (
+                            str(relative),
+                            entry.get("url", ""),
+                        )
+                    )
+                    continue
+
+                if entry_type != "file":
+                    continue
+                if str(relative).casefold().endswith((".html", ".htm")):
+                    continue
+
+                download_url = entry.get("download_url")
+                if download_url:
+                    files_to_download.append((relative, download_url))
+
+        if not files_to_download:
+            raise RuntimeError(
+                "No PS2 CONFIG files were found through the GitHub API."
+            )
+
+        total = len(files_to_download)
+        for index, (relative, download_url) in enumerate(
+            files_to_download,
+            start=1,
+        ):
+            destination = config_root.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(
+                destination.name + ".download"
+            )
+
+            try:
+                data = self._urlopen_bytes(download_url, timeout=30)
+                temporary.write_bytes(data)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+            if index == total or index % 20 == 0:
+                fraction = index / total
+                self.config_update_queue.put(
+                    (
+                        "progress",
+                        int(fraction * 100),
+                        (
+                            "Installing CONFIG files from GitHub… "
+                            f"{index} / {total} · {int(fraction * 100)}%"
+                        ),
+                    )
+                )
+
+        return total
+
     def _config_update_worker(self):
+        archive_error = None
         try:
-            with tempfile.TemporaryDirectory(
-                prefix="ps2_config_update_"
-            ) as temporary_dir:
-                archive_path = Path(temporary_dir) / "webman_mod.zip"
-                self._download_config_archive(archive_path)
-                count = self._install_configs_from_archive(archive_path)
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="ps2_config_update_"
+                ) as temporary_dir:
+                    archive_path = Path(temporary_dir) / "webman_mod.zip"
+                    self._download_config_archive(archive_path)
+                    count = self._install_configs_from_archive(archive_path)
+            except Exception as error:
+                archive_error = error
+                self.config_update_queue.put(
+                    (
+                        "progress",
+                        2,
+                        "Archive download unavailable · trying GitHub file API…",
+                    )
+                )
+                count = self._download_configs_via_github_api()
 
             self.config_update_queue.put(("done", count))
         except Exception as error:
+            if archive_error:
+                error = RuntimeError(
+                    f"Archive download failed: {archive_error}\n\n"
+                    f"GitHub file fallback failed: {error}"
+                )
             self.config_update_queue.put(("error", str(error)))
 
     def poll_config_update_queue(self):
@@ -2236,12 +3330,75 @@ class PS2ClassicsGUIMod:
         except tk.TclError:
             pass
 
-    def rescan_configs(self, show_message=True):
-        disc_id = self.detected_disc_id.get().strip()
-        if not disc_id and self.iso_path.get().strip():
-            disc_id = self.refresh_disc_id_cache() or ""
+    def show_config_rescan_loading(self):
+        if not hasattr(self, "config_rescan_progress"):
+            return
+        try:
+            self.rescan_configs_button.pack_forget()
+            if not self.config_rescan_progress.winfo_manager():
+                self.config_rescan_progress.pack(fill="both", expand=True)
+            self.config_rescan_progress.start(12)
+            if hasattr(self, "update_configs_button"):
+                self.update_configs_button.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass
 
-        if not disc_id:
+    def hide_config_rescan_loading(self):
+        if not hasattr(self, "config_rescan_progress"):
+            return
+        try:
+            self.config_rescan_progress.stop()
+            self.config_rescan_progress.pack_forget()
+            if not self.rescan_configs_button.winfo_manager():
+                self.rescan_configs_button.pack(fill="both", expand=True)
+            if hasattr(self, "update_configs_button") and not self.config_update_running:
+                self.update_configs_button.configure(state=tk.NORMAL)
+        except tk.TclError:
+            pass
+
+    def _rescan_configs_worker(self, disc_id, source_text, show_message):
+        try:
+            resolved_disc_id = str(disc_id or "").strip()
+            source = Path(source_text) if source_text else None
+
+            if (
+                not resolved_disc_id
+                and source
+                and source.is_file()
+                and not self.source_is_encrypted(source)
+            ):
+                resolved_disc_id = self.detect_disc_id(source) or ""
+
+            if not resolved_disc_id:
+                self.config_rescan_queue.put(
+                    ("no_disc", bool(show_message))
+                )
+                return
+
+            config_path = self.find_config_for_disc_id(resolved_disc_id)
+            self.config_rescan_queue.put(
+                (
+                    "result",
+                    resolved_disc_id,
+                    str(config_path) if config_path else "",
+                    bool(show_message),
+                )
+            )
+        except Exception as error:
+            self.config_rescan_queue.put(
+                ("error", str(error), bool(show_message))
+            )
+
+    def rescan_configs(self, show_message=True):
+        if self.config_rescan_running:
+            return None
+
+        source_text = self.iso_path.get().strip()
+        disc_id = self.detected_disc_id.get().strip()
+
+        if not disc_id and not (
+            source_text and Path(source_text).is_file()
+        ):
             self.config_update_status.set(
                 "No disc ID is available for CONFIG matching."
             )
@@ -2253,44 +3410,232 @@ class PS2ClassicsGUIMod:
                 )
             return None
 
-        config_path = self.find_config_for_disc_id(disc_id)
-        if config_path:
-            self.auto_config_path = str(config_path)
-            self.param_hip_path.set(self.auto_config_path)
-            self.config_update_status.set(
-                f"CONFIG found: {config_path.parent.name}/{config_path.name}"
-            )
-            self.log(f"CONFIG re-scan matched: {config_path}")
-            self.schedule_build_readiness()
-            return config_path
+        self.config_rescan_running = True
+        self.config_update_status.set("Scanning CONFIG files...")
+        self.show_config_rescan_loading()
 
-        self.config_update_status.set(
-            f"No CONFIG found for {disc_id}."
+        worker = threading.Thread(
+            target=self._rescan_configs_worker,
+            args=(disc_id, source_text, show_message),
+            daemon=True,
         )
-        if show_message:
-            messagebox.showinfo(
-                "Re-scan configs",
-                f"No matching CONFIG was found for {disc_id}.",
-                parent=self.root,
-            )
+        worker.start()
         return None
+
+    def poll_config_rescan_queue(self):
+        try:
+            while True:
+                event = self.config_rescan_queue.get_nowait()
+                event_type = event[0]
+                self.config_rescan_running = False
+                self.hide_config_rescan_loading()
+
+                if event_type == "no_disc":
+                    self.config_update_status.set(
+                        "No disc ID is available for CONFIG matching."
+                    )
+                    if event[1]:
+                        messagebox.showinfo(
+                            "Re-scan configs",
+                            "No disc ID could be detected for the selected source.",
+                            parent=self.root,
+                        )
+                    continue
+
+                if event_type == "error":
+                    self.config_update_status.set("CONFIG re-scan failed.")
+                    self.log(f"CONFIG re-scan failed: {event[1]}")
+                    if event[2]:
+                        messagebox.showerror(
+                            "Re-scan configs",
+                            event[1],
+                            parent=self.root,
+                        )
+                    continue
+
+                disc_id, config_text, show_message = event[1:]
+                if config_text:
+                    config_path = Path(config_text)
+                    self.auto_config_path = config_text
+                    self.param_hip_path.set(config_text)
+                    self.config_update_status.set(
+                        f"CONFIG found: {config_path.parent.name}/{config_path.name}"
+                    )
+                    self.log(f"CONFIG re-scan matched: {config_path}")
+                else:
+                    self.auto_config_path = ""
+                    self.config_update_status.set(
+                        f"No CONFIG found for {disc_id}."
+                    )
+                    if show_message:
+                        messagebox.showinfo(
+                            "Re-scan configs",
+                            f"No matching CONFIG was found for {disc_id}.",
+                            parent=self.root,
+                        )
+
+                self.schedule_build_readiness()
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(120, self.poll_config_rescan_queue)
+        except tk.TclError:
+            pass
 
     def compatibility_cache_path(self):
         return self.script_dir / self.COMPATIBILITY_CACHE_FILE
 
-    def compatibility_cache_exists(self):
+    def compatibility_cache_schema_version(self):
         path = self.compatibility_cache_path()
         if not path.is_file():
-            return False
+            return ""
 
         try:
-            with sqlite3.connect(path) as connection:
+            with sqlite3.connect(path, timeout=2) as connection:
                 row = connection.execute(
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()
-            return bool(row and row[0] == "1")
+            return str(row[0]) if row else ""
         except (sqlite3.Error, OSError):
-            return False
+            return ""
+
+    def compatibility_cache_exists(self):
+        return self.compatibility_cache_schema_version() in {"1", "2"}
+
+    def ensure_compatibility_lookup_schema(self, database_path=None):
+        """Create indexed compatibility lookup tables without rebuilding the cache."""
+        database_path = Path(
+            database_path or self.compatibility_cache_path()
+        )
+
+        with sqlite3.connect(database_path, timeout=10) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS compatibility_names (
+                    compatibility_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    PRIMARY KEY (compatibility_id, normalized_name)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_compatibility_names_normalized
+                ON compatibility_names(normalized_name)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS compatibility_serials (
+                    compatibility_id INTEGER NOT NULL,
+                    serial TEXT NOT NULL,
+                    compact_serial TEXT NOT NULL,
+                    PRIMARY KEY (compatibility_id, compact_serial)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_compatibility_serials_compact
+                ON compatibility_serials(compact_serial)
+                """
+            )
+
+            name_count = connection.execute(
+                "SELECT COUNT(*) FROM compatibility_names"
+            ).fetchone()[0]
+            compat_count = connection.execute(
+                "SELECT COUNT(*) FROM compatibility"
+            ).fetchone()[0]
+
+            if compat_count and not name_count:
+                name_rows = []
+                serial_rows = []
+
+                for compat_id, names_json, serials_json in connection.execute(
+                    "SELECT id, names, serials FROM compatibility"
+                ):
+                    try:
+                        names = json.loads(names_json)
+                    except (TypeError, json.JSONDecodeError):
+                        names = []
+
+                    try:
+                        serials = json.loads(serials_json)
+                    except (TypeError, json.JSONDecodeError):
+                        serials = []
+
+                    seen_names = set()
+                    for name in names:
+                        normalized = self.normalize_compatibility_title(name)
+                        if not normalized or normalized in seen_names:
+                            continue
+                        seen_names.add(normalized)
+                        name_rows.append(
+                            (compat_id, str(name), normalized)
+                        )
+
+                    seen_serials = set()
+                    for serial in serials:
+                        normalized = self.normalize_disc_id(serial)
+                        if not normalized:
+                            continue
+                        compact = re.sub(
+                            r"[^A-Z0-9]",
+                            "",
+                            normalized.upper(),
+                        )
+                        if not compact or compact in seen_serials:
+                            continue
+                        seen_serials.add(compact)
+                        serial_rows.append(
+                            (compat_id, str(serial), compact)
+                        )
+
+                if name_rows:
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO compatibility_names
+                        (compatibility_id, name, normalized_name)
+                        VALUES (?, ?, ?)
+                        """,
+                        name_rows,
+                    )
+
+                if serial_rows:
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO compatibility_serials
+                        (compatibility_id, serial, compact_serial)
+                        VALUES (?, ?, ?)
+                        """,
+                        serial_rows,
+                    )
+
+            lookup_count = connection.execute(
+                "SELECT COUNT(*) FROM compatibility_names"
+            ).fetchone()[0]
+            serial_lookup_count = connection.execute(
+                "SELECT COUNT(*) FROM compatibility_serials"
+            ).fetchone()[0]
+
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("schema_version", "2"),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("compatibility_lookup_rows", str(lookup_count)),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("compatibility_serial_lookup_rows", str(serial_lookup_count)),
+            )
+            connection.commit()
+
+        return lookup_count, serial_lookup_count
 
     def update_compat_cache_button(self):
         if not hasattr(self, "compat_cache_button"):
@@ -2298,27 +3643,47 @@ class PS2ClassicsGUIMod:
 
         if self.compat_cache_running:
             self.compat_cache_button.configure(
-                text="Loading…",
+                text="Rebuilding…",
                 state=tk.DISABLED,
             )
             return
 
         self.compat_cache_button.configure(
-            text=(
-                "Refresh"
-                if self.compatibility_cache_exists()
-                else "Build cache"
-            ),
+            text="Rebuild cache",
             state=tk.NORMAL,
         )
 
-    def reset_compatibility_display(self):
-        self.stop_compatibility_spinner()
-        if self.compatibility_cache_exists():
-            self.compatibility_status.set("Not checked")
-        else:
-            self.compatibility_status.set("No cache")
+    def show_source_metadata_loading(self):
+        if not hasattr(self, "compat_source_progress"):
+            return
+        if self.input_mode.get() != "package":
+            return
+        try:
+            self.compat_check_button.pack_forget()
+            if not self.compat_source_progress.winfo_manager():
+                self.compat_source_progress.pack(fill="both", expand=True)
+            if not self.source_metadata_loading:
+                self.compat_source_progress.start(12)
+            self.source_metadata_loading = True
+        except tk.TclError:
+            pass
 
+    def hide_source_metadata_loading(self):
+        if not hasattr(self, "compat_source_progress"):
+            return
+        self.source_metadata_loading = False
+        try:
+            self.compat_source_progress.stop()
+            self.compat_source_progress.pack_forget()
+            if not self.compat_check_button.winfo_manager():
+                self.compat_check_button.pack(fill="both", expand=True)
+        except tk.TclError:
+            pass
+
+    def reset_compatibility_display(self):
+        self.compatibility_request_id += 1
+        self.stop_compatibility_spinner()
+        self.compatibility_status.set("Not checked")
         self.compatibility_status_label.configure(
             bg=self.COLOR_PANEL,
             fg=self.COLOR_TEXT_MUTED,
@@ -2327,11 +3692,34 @@ class PS2ClassicsGUIMod:
         self.compatibility_notes.set("")
         self.compatibility_notes_expanded = False
         self.compatibility_notes_label.pack_forget()
+        self.compatibility_notes_container.pack_forget()
         self.compatibility_notes_button.configure(
             text="Notes",
             state=tk.DISABLED,
         )
+        self.compatibility_notes_button.pack_forget()
+        if hasattr(self, "compat_check_button"):
+            current_source = self.iso_path.get().strip()
+            can_check = bool(
+                self.input_mode.get() == "package"
+                and current_source
+                and self._source_metadata_ready_path == current_source
+                and not self.compat_cache_running
+            )
+            self.compat_check_button.configure(
+                state=tk.NORMAL if can_check else tk.DISABLED
+            )
+            if (
+                self.input_mode.get() == "package"
+                and current_source
+                and Path(current_source).is_file()
+                and self._source_metadata_ready_path != current_source
+            ):
+                self.show_source_metadata_loading()
+            else:
+                self.hide_source_metadata_loading()
         self.update_compat_cache_button()
+        self._refresh_form_geometry()
 
     def toggle_compatibility_notes(self):
         if not self.compatibility_notes.get().strip():
@@ -2349,38 +3737,47 @@ class PS2ClassicsGUIMod:
         )
 
         if self.compatibility_notes_expanded:
+            if not self.compatibility_notes_container.winfo_manager():
+                self.compatibility_notes_container.pack(fill="x")
             self.compatibility_notes_label.pack(
                 fill="x",
-                padx=(12, 8),
+                padx=(12, 9),
                 pady=(2, 3),
             )
         else:
             self.compatibility_notes_label.pack_forget()
+            self.compatibility_notes_container.pack_forget()
+
+        self._refresh_form_geometry()
+
+    def _refresh_form_geometry(self):
+        def apply():
+            try:
+                self.form_frame.update_idletasks()
+                self.source_io_frame.update_idletasks()
+                if hasattr(self, "left_canvas"):
+                    self.left_canvas.configure(
+                        scrollregion=self.left_canvas.bbox("all")
+                    )
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after_idle(apply)
+        except tk.TclError:
+            pass
 
     def refresh_compatibility_cache(self):
         if self.compat_cache_running:
             return
 
+        self.compatibility_request_id += 1
         self.compatibility_source_override = None
-
-        if not self.compatibility_cache_exists():
-            source = self.find_local_compatibility_snapshot()
-            if source is None:
-                selected = filedialog.askopenfilename(
-                    title="Select PSDevWiki compatibility HTML snapshot",
-                    initialdir=str(self.script_dir),
-                    filetypes=[
-                        ("HTML snapshot", "*.html *.htm"),
-                        ("All files", "*.*"),
-                    ],
-                )
-                if not selected:
-                    return
-                source = Path(selected)
-            self.compatibility_source_override = source
-
         self.compat_cache_running = True
         self.update_compat_cache_button()
+        self.compatibility_status.set("Updating cache...")
+        if hasattr(self, "compat_check_button"):
+            self.compat_check_button.configure(state=tk.DISABLED)
 
         worker = threading.Thread(
             target=self._compat_cache_worker,
@@ -2396,6 +3793,20 @@ class PS2ClassicsGUIMod:
         return None
 
     def _load_compatibility_source_html(self):
+        errors = []
+
+        try:
+            data = self._urlopen_bytes(
+                self.COMPATIBILITY_SOURCE_URL,
+                timeout=45,
+            )
+            text = data.decode("utf-8", errors="ignore")
+            if "PS2 Classic" in text and "Futurama" in text:
+                return text, self.COMPATIBILITY_SOURCE_URL
+            errors.append("PSDevWiki: unexpected page content")
+        except Exception as error:
+            errors.append(f"PSDevWiki: {error}")
+
         candidates = []
         if self.compatibility_source_override:
             candidates.append(Path(self.compatibility_source_override))
@@ -2404,27 +3815,22 @@ class PS2ClassicsGUIMod:
         if local_default and local_default not in candidates:
             candidates.append(local_default)
 
-        errors = []
         for candidate in candidates:
             try:
                 text = candidate.read_text(
                     encoding="utf-8",
                     errors="ignore",
                 )
-                if (
-                    "Compatibility Notes" in text
-                    and "PS2 Classic" in text
-                ):
+                if "PS2 Classic" in text and "Futurama" in text:
                     return text, str(candidate)
                 errors.append(f"{candidate}: unexpected page content")
             except OSError as error:
                 errors.append(f"{candidate}: {error}")
 
         raise RuntimeError(
-            "No local PSDevWiki compatibility snapshot is available. "
-            "Copy the bundled comp_cache.db into the application root, or "
-            "save the compatibility page as HTML and select that file."
-            + ("\n\n" + "\n".join(errors[-3:]) if errors else "")
+            "The PSDevWiki compatibility list could not be downloaded and "
+            "no usable local HTML snapshot is available."
+            + ("\\n\\n" + "\\n".join(errors[-4:]) if errors else "")
         )
 
     def _download_datacenter_title_maps(self):
@@ -2503,6 +3909,8 @@ class PS2ClassicsGUIMod:
             )
             connection.commit()
 
+        self.ensure_compatibility_lookup_schema(temporary)
+
     @staticmethod
     def _refresh_title_table(database_path, title_maps):
         with sqlite3.connect(database_path) as connection:
@@ -2534,43 +3942,47 @@ class PS2ClassicsGUIMod:
             connection.commit()
             return title_count
 
+    def _replace_compatibility_cache(self, temporary, cache_path):
+        """Replace cache contents through SQLite so Windows file handles are safe."""
+        with sqlite3.connect(temporary, timeout=10) as source_connection:
+            with sqlite3.connect(cache_path, timeout=10) as target_connection:
+                source_connection.backup(target_connection)
+                target_connection.commit()
+
     def _compat_cache_worker(self):
         cache_path = self.compatibility_cache_path()
-        temporary = cache_path.with_suffix(".db.tmp")
+        temporary = cache_path.with_name(
+            cache_path.name + f".{os.getpid()}.tmp"
+        )
         temporary.unlink(missing_ok=True)
 
         try:
-            if self.compatibility_cache_exists():
-                shutil.copy2(cache_path, temporary)
-                with sqlite3.connect(temporary) as connection:
-                    compat_count = connection.execute(
-                        "SELECT COUNT(*) FROM compatibility"
-                    ).fetchone()[0]
-            else:
-                html_text, source_name = self._load_compatibility_source_html()
-                rows = self._extract_compatibility_rows(html_text)
-                if not rows:
-                    raise RuntimeError(
-                        "No compatibility rows were found in the HTML snapshot."
-                    )
-                self._create_compatibility_database(
-                    temporary,
-                    rows,
-                    source_name,
+            html_text, source_name = self._load_compatibility_source_html()
+            rows = self._extract_compatibility_rows(html_text)
+            if not rows:
+                raise RuntimeError(
+                    "No compatibility rows were found in the PSDevWiki page."
                 )
-                compat_count = len(rows)
 
-            title_maps, title_errors = self._download_datacenter_title_maps()
-            title_count = self._refresh_title_table(temporary, title_maps)
+            self._create_compatibility_database(
+                temporary,
+                rows,
+                source_name,
+            )
+            compat_count = len(rows)
 
-            os.replace(temporary, cache_path)
-            self._local_compatibility_rows = None
+            with self.compatibility_db_lock:
+                self._replace_compatibility_cache(
+                    temporary,
+                    cache_path,
+                )
+
             self.compat_cache_queue.put(
                 (
                     "done",
                     compat_count,
-                    title_count,
-                    title_errors,
+                    0,
+                    [],
                 )
             )
         except Exception as error:
@@ -2598,10 +4010,19 @@ class PS2ClassicsGUIMod:
                             "Compatibility cache title warnings: "
                             + "; ".join(title_errors)
                         )
-                    if self.iso_path.get().strip():
-                        self.schedule_compatibility_check()
-                    else:
-                        self.reset_compatibility_display()
+                    self.reset_compatibility_display()
+                    current_source = self.iso_path.get().strip()
+                    if (
+                        self.input_mode.get() == "package"
+                        and current_source
+                        and self._source_metadata_ready_path == current_source
+                    ):
+                        try:
+                            self.root.after_idle(
+                                self.schedule_compatibility_check
+                            )
+                        except tk.TclError:
+                            pass
                     continue
 
                 self.log(f"Compatibility cache update failed: {event[1]}")
@@ -2620,78 +4041,30 @@ class PS2ClassicsGUIMod:
             pass
 
     def start_compatibility_spinner(self):
-        self.stop_compatibility_spinner()
-        self.compatibility_spinner_index = 0
-        self._tick_compatibility_spinner()
+        self.compatibility_status.set("Checking...")
 
     def stop_compatibility_spinner(self):
-        if self.compatibility_spinner_after_id is not None:
-            try:
-                self.root.after_cancel(self.compatibility_spinner_after_id)
-            except tk.TclError:
-                pass
         self.compatibility_spinner_after_id = None
 
-    def _tick_compatibility_spinner(self):
-        frames = ("Checking ·", "Checking ··", "Checking ···")
-        self.compatibility_status.set(
-            frames[self.compatibility_spinner_index % len(frames)]
-        )
-        self.compatibility_spinner_index += 1
-        try:
-            self.compatibility_spinner_after_id = self.root.after(
-                220,
-                self._tick_compatibility_spinner,
-            )
-        except tk.TclError:
-            self.compatibility_spinner_after_id = None
-
     def schedule_compatibility_check(self):
-        if self.compatibility_after_id is not None:
-            try:
-                self.root.after_cancel(self.compatibility_after_id)
-            except tk.TclError:
-                pass
-
-        if not self.iso_path.get().strip():
+        source_text = self.iso_path.get().strip()
+        if not source_text or not Path(source_text).is_file():
             self.reset_compatibility_display()
-            self.compatibility_after_id = None
             return
 
-        self.compatibility_after_id = self.root.after(
-            450,
-            self.start_compatibility_check,
-        )
-
-    def start_compatibility_check(self):
-        self.compatibility_after_id = None
-        source_text = self.iso_path.get().strip()
-        if not source_text:
-            self.reset_compatibility_display()
+        if self._source_metadata_ready_path != source_text:
+            self.compat_check_button.configure(state=tk.DISABLED)
+            self.show_source_metadata_loading()
+            self.refresh_source_dependent_data(force=True)
             return
 
         if not self.compatibility_cache_exists():
-            self.stop_compatibility_spinner()
+            self.reset_compatibility_display()
             self.compatibility_status.set("No cache")
-            self.compatibility_status_label.configure(
-                bg=self.COLOR_PANEL,
-                fg=self.COLOR_TEXT_MUTED,
-            )
-            self.compatibility_match.set("")
-            self.compatibility_notes.set("")
-            self.compatibility_notes_button.configure(
-                text="Notes",
-                state=tk.DISABLED,
-            )
-            self.compatibility_notes_label.pack_forget()
-            self.update_compat_cache_button()
             return
 
         self.compatibility_request_id += 1
         request_id = self.compatibility_request_id
-        disc_id = self.detected_disc_id.get().strip()
-        title = self.game_title.get().strip()
-
         self.start_compatibility_spinner()
         self.compatibility_status_label.configure(
             bg=self.COLOR_PANEL_ACTIVE,
@@ -2703,8 +4076,24 @@ class PS2ClassicsGUIMod:
             text="Notes",
             state=tk.DISABLED,
         )
+        self.compatibility_notes_button.pack_forget()
         self.compatibility_notes_label.pack_forget()
+        self.compatibility_notes_container.pack_forget()
         self.compatibility_notes_expanded = False
+        self.compat_check_button.configure(state=tk.DISABLED)
+        self.start_compatibility_check(request_id)
+
+    def start_compatibility_check(self, request_id):
+        if request_id != self.compatibility_request_id:
+            return
+
+        source_text = self.iso_path.get().strip()
+        if not source_text:
+            self.reset_compatibility_display()
+            return
+
+        disc_id = self.detected_disc_id.get().strip()
+        title = self.game_title.get().strip()
 
         worker = threading.Thread(
             target=self._compatibility_worker,
@@ -2713,45 +4102,134 @@ class PS2ClassicsGUIMod:
         )
         worker.start()
 
-    def load_local_compatibility_rows(self):
-        if self._local_compatibility_rows is not None:
-            return self._local_compatibility_rows
+    @staticmethod
+    def compatibility_row_from_record(record):
+        if not record:
+            return None
 
-        cache_path = self.compatibility_cache_path()
-        if not self.compatibility_cache_exists():
-            raise RuntimeError("Compatibility cache is not available.")
+        compat_id, names, pal, ntsc_u, ntsc_j, notes, serials = record
+        try:
+            row_names = json.loads(names)
+        except (TypeError, json.JSONDecodeError):
+            row_names = []
 
-        rows = []
-        with sqlite3.connect(cache_path) as connection:
-            for names, pal, ntsc_u, ntsc_j, notes, serials in connection.execute(
-                """
-                SELECT names, pal, ntsc_u, ntsc_j, notes, serials
-                FROM compatibility
-                """
-            ):
-                row_names = json.loads(names)
-                row_serials = json.loads(serials)
-                rows.append(
-                    {
-                        "names": row_names,
-                        "statuses": [pal, ntsc_u, ntsc_j],
-                        "notes": notes,
-                        "serials": row_serials,
-                        "_normalized_names": [
-                            self.normalize_compatibility_title(value)
-                            for value in row_names
-                        ],
-                        "_compact_serials": {
-                            re.sub(r"[^A-Z0-9]", "", normalized)
-                            for value in row_serials
-                            for normalized in [self.normalize_disc_id(value)]
-                            if normalized
-                        },
-                    }
+        try:
+            row_serials = json.loads(serials)
+        except (TypeError, json.JSONDecodeError):
+            row_serials = []
+
+        return {
+            "id": compat_id,
+            "names": row_names,
+            "statuses": [pal, ntsc_u, ntsc_j],
+            "notes": notes,
+            "serials": row_serials,
+        }
+
+    @staticmethod
+    def compatibility_record_sql():
+        return (
+            "SELECT c.id, c.names, c.pal, c.ntsc_u, c.ntsc_j, "
+            "c.notes, c.serials "
+        )
+
+    def lookup_compatibility_by_serial(self, connection, disc_id):
+        normalized = self.normalize_disc_id(disc_id or "")
+        if not normalized:
+            return None
+
+        compact = re.sub(r"[^A-Z0-9]", "", normalized.upper())
+        record = connection.execute(
+            self.compatibility_record_sql()
+            + """
+              FROM compatibility_serials AS s
+              JOIN compatibility AS c ON c.id = s.compatibility_id
+              WHERE s.compact_serial = ?
+              LIMIT 1
+              """,
+            (compact,),
+        ).fetchone()
+        return self.compatibility_row_from_record(record)
+
+    def lookup_compatibility_by_title(self, connection, titles):
+        normalized_titles = []
+        for title in titles:
+            normalized = self.normalize_compatibility_title(title)
+            if normalized and normalized not in normalized_titles:
+                normalized_titles.append(normalized)
+
+        if not normalized_titles:
+            return None, 0.0, "none"
+
+        placeholders = ",".join("?" for _ in normalized_titles)
+        record = connection.execute(
+            self.compatibility_record_sql()
+            + f"""
+              FROM compatibility_names AS n
+              JOIN compatibility AS c ON c.id = n.compatibility_id
+              WHERE n.normalized_name IN ({placeholders})
+              LIMIT 1
+              """,
+            normalized_titles,
+        ).fetchone()
+
+        if record:
+            return self.compatibility_row_from_record(record), 1.0, "title"
+
+        # Fuzzy fallback works only on a small SQL shortlist instead of all
+        # compatibility rows. This keeps CPU work away from Tk's UI loop.
+        tokens = []
+        for normalized in normalized_titles:
+            for token in normalized.split():
+                if len(token) >= 4 and token not in tokens:
+                    tokens.append(token)
+
+        tokens.sort(key=len, reverse=True)
+        tokens = tokens[:4]
+        if not tokens:
+            return None, 0.0, "none"
+
+        where = " OR ".join(
+            "n.normalized_name LIKE ?" for _ in tokens
+        )
+        patterns = [f"%{token}%" for token in tokens]
+
+        candidates = connection.execute(
+            """
+            SELECT c.id, c.names, c.pal, c.ntsc_u, c.ntsc_j,
+                   c.notes, c.serials, n.normalized_name
+            FROM compatibility_names AS n
+            JOIN compatibility AS c ON c.id = n.compatibility_id
+            WHERE """
+            + where
+            + """
+            LIMIT 96
+            """,
+            patterns,
+        ).fetchall()
+
+        best_record = None
+        best_score = 0.0
+
+        for candidate in candidates:
+            candidate_name = candidate[-1]
+            for normalized in normalized_titles:
+                score = self._compatibility_title_score(
+                    normalized,
+                    candidate_name,
                 )
+                if score > best_score:
+                    best_score = score
+                    best_record = candidate[:-1]
 
-        self._local_compatibility_rows = rows
-        return rows
+        if best_record is not None and best_score >= 0.76:
+            return (
+                self.compatibility_row_from_record(best_record),
+                best_score,
+                "title",
+            )
+
+        return None, best_score, "none"
 
     @staticmethod
     def datacenter_serial(disc_id):
@@ -2876,6 +4354,43 @@ class PS2ClassicsGUIMod:
             return 2, "NTSC-J/Asia"
         return None, "Region unknown"
 
+    @staticmethod
+    def compatibility_region_from_source(source_text="", title=""):
+        text = f"{source_text} {title}".casefold()
+
+        if any(
+            token in text
+            for token in ("(usa)", "[usa]", "ntsc-u", "ntsc u", "(us)")
+        ):
+            return 1, "NTSC-U"
+
+        if any(
+            token in text
+            for token in (
+                "(japan)",
+                "[japan]",
+                "(jpn)",
+                "[jpn]",
+                "ntsc-j",
+                "ntsc j",
+            )
+        ):
+            return 2, "NTSC-J/Asia"
+
+        if any(
+            token in text
+            for token in (
+                "(europe)",
+                "[europe]",
+                "(pal)",
+                "[pal]",
+                "pal-eu",
+            )
+        ):
+            return 0, "PAL-EU"
+
+        return None, "Region unknown"
+
     def _compatibility_title_score(self, query, candidate):
         query = self.normalize_compatibility_title(query)
         candidate = self.normalize_compatibility_title(candidate)
@@ -2906,84 +4421,6 @@ class PS2ClassicsGUIMod:
 
         return max(sequence, overlap, containment)
 
-    def find_compatibility_match(self, rows, disc_id, title, source_text):
-        normalized_disc = self.normalize_disc_id(disc_id or "")
-        compact_disc = (
-            re.sub(r"[^A-Z0-9]", "", normalized_disc)
-            if normalized_disc
-            else ""
-        )
-
-        if compact_disc:
-            for row in rows:
-                if compact_disc in row.get("_compact_serials", set()):
-                    return row, 1.0, "disc ID"
-
-        queries = []
-        if title:
-            queries.append(title)
-        if source_text:
-            source_title = self.clean_title_from_path(source_text)
-            if source_title and source_title not in queries:
-                queries.append(source_title)
-
-        normalized_queries = [
-            self.normalize_compatibility_title(value)
-            for value in queries
-        ]
-        normalized_queries = [value for value in normalized_queries if value]
-        if not normalized_queries:
-            return None, 0.0, "none"
-
-        # Exact normalized titles are common and should return immediately.
-        for row in rows:
-            names = row.get("_normalized_names") or [
-                self.normalize_compatibility_title(value)
-                for value in row.get("names", [])
-            ]
-            if any(query in names for query in normalized_queries):
-                return row, 1.0, "title"
-
-        # Cheap token/containment fallback avoids thousands of SequenceMatcher
-        # calls in the worker thread, which can otherwise starve Tk's UI loop.
-        best_row = None
-        best_score = 0.0
-        for row in rows:
-            names = row.get("_normalized_names") or []
-            for query in normalized_queries:
-                query_tokens = set(query.split())
-                for candidate in names:
-                    if not candidate:
-                        continue
-
-                    score = 0.0
-                    shorter = min(len(query), len(candidate))
-                    longer = max(len(query), len(candidate))
-                    if shorter >= 7 and (
-                        query in candidate or candidate in query
-                    ):
-                        score = max(
-                            score,
-                            0.88 + 0.12 * (shorter / longer),
-                        )
-
-                    candidate_tokens = set(candidate.split())
-                    union = query_tokens | candidate_tokens
-                    if union:
-                        score = max(
-                            score,
-                            len(query_tokens & candidate_tokens) / len(union),
-                        )
-
-                    if score > best_score:
-                        best_score = score
-                        best_row = row
-
-        if best_row is not None and best_score >= 0.76:
-            return best_row, best_score, "title"
-
-        return None, best_score, "none"
-
     def _compatibility_worker(
         self,
         request_id,
@@ -2992,30 +4429,49 @@ class PS2ClassicsGUIMod:
         source_text,
     ):
         try:
-            rows = self.load_local_compatibility_rows()
-            datacenter_title, datacenter_source = (
-                self.resolve_title_from_datacenter(disc_id)
-                if disc_id
-                else ("", "unavailable")
-            )
+            cache_path = self.compatibility_cache_path()
 
-            lookup_title = datacenter_title or title
-            row, _score, _match_method = self.find_compatibility_match(
-                rows,
-                disc_id,
-                lookup_title,
-                source_text,
-            )
+            with self.compatibility_db_lock:
+                if self.compatibility_cache_schema_version() == "1":
+                    self.ensure_compatibility_lookup_schema(cache_path)
 
-            if row is None and datacenter_title and title:
-                row, _score, _match_method = self.find_compatibility_match(
-                    rows,
-                    disc_id,
-                    title,
-                    source_text,
+                datacenter_title, datacenter_source = (
+                    self.resolve_title_from_datacenter(disc_id)
+                    if disc_id
+                    else ("", "unavailable")
                 )
 
+                source_title = (
+                    self.clean_title_from_path(source_text)
+                    if source_text
+                    else ""
+                )
+                title_queries = []
+                for value in (datacenter_title, title, source_title):
+                    if value and value not in title_queries:
+                        title_queries.append(value)
+
+                with sqlite3.connect(cache_path, timeout=5) as connection:
+                    row = self.lookup_compatibility_by_serial(
+                        connection,
+                        disc_id,
+                    )
+                    match_method = "disc ID" if row else "none"
+
+                    if row is None:
+                        row, _score, match_method = (
+                            self.lookup_compatibility_by_title(
+                                connection,
+                                title_queries,
+                            )
+                        )
+
             region_index, region_name = self.compatibility_region(disc_id)
+            if region_index is None:
+                region_index, region_name = self.compatibility_region_from_source(
+                    source_text,
+                    title,
+                )
             serial = self.datacenter_serial(disc_id)
 
             if row is None:
@@ -3054,8 +4510,7 @@ class PS2ClassicsGUIMod:
                 if value
             ]
             match_text = " · ".join(details)
-            if datacenter_source == "cache" or self.compatibility_cache_exists():
-                match_text += " (cache)"
+            match_text += " (cache)"
 
             self.compatibility_queue.put(
                 (
@@ -3065,6 +4520,7 @@ class PS2ClassicsGUIMod:
                         "status": status or "Unknown",
                         "notes": notes,
                         "match": match_text,
+                        "method": match_method,
                     },
                 )
             )
@@ -3095,7 +4551,10 @@ class PS2ClassicsGUIMod:
                         text="Notes",
                         state=tk.DISABLED,
                     )
+                    self.compatibility_notes_button.pack_forget()
                     self.compatibility_notes_label.pack_forget()
+                    self.compatibility_notes_container.pack_forget()
+                    self.compat_check_button.configure(state=tk.NORMAL)
                     continue
 
                 self.stop_compatibility_spinner()
@@ -3116,10 +4575,19 @@ class PS2ClassicsGUIMod:
                 self.compatibility_notes.set(notes)
                 self.compatibility_notes_expanded = False
                 self.compatibility_notes_label.pack_forget()
+                self.compatibility_notes_container.pack_forget()
                 self.compatibility_notes_button.configure(
-                    text="▶ Notes" if notes else "Notes",
-                    state=tk.NORMAL if notes else tk.DISABLED,
+                    text="▶ Notes",
+                    state=tk.NORMAL,
                 )
+                if notes:
+                    self.compatibility_notes_button.pack(
+                        fill="x",
+                        pady=(1, 0),
+                    )
+                else:
+                    self.compatibility_notes_button.pack_forget()
+                self.compat_check_button.configure(state=tk.NORMAL)
         except queue.Empty:
             pass
 
@@ -3246,12 +4714,46 @@ class PS2ClassicsGUIMod:
         compact = re.sub(r"[^A-Z0-9]", "", str(disc_id).upper())
         return compact[:9]
 
+    @staticmethod
+    def package_content_region_prefix(disc_id="", title_id=""):
+        """Return the standalone PS2 Classics package prefix for the game region."""
+        identity = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            str(title_id or disc_id).upper(),
+        )
+        serial_prefix = identity[:4]
+
+        if serial_prefix in {"SLES", "SCES", "SCED", "TCES"}:
+            return "EP0000"
+
+        if serial_prefix in {
+            "SLPM",
+            "SLPS",
+            "SCPS",
+            "SCAJ",
+            "SCKA",
+            "PBPX",
+            "PAPX",
+            "PCPX",
+            "SCCS",
+        }:
+            return "JP0000"
+
+        # US serials and unknown/custom IDs use the pop-fe2-style prefix.
+        return "UP0000"
+
     def generated_content_id(self, disc_id, title_id):
-        """Create a stable per-game package Content ID."""
+        """Create a region-aware standalone PS2 Classics package Content ID."""
         title_id = re.sub(r"[^A-Z0-9]", "", str(title_id).upper())[:9]
         if len(title_id) != 9:
             return ""
-        return f"2P0001-{title_id}_00-PS2CLASSICS00000"
+
+        package_prefix = self.package_content_region_prefix(
+            disc_id,
+            title_id,
+        )
+        return f"{package_prefix}-{title_id}_00-PS2CLASSICS00000"
 
     @staticmethod
     def clean_title_from_path(path):
@@ -3263,6 +4765,11 @@ class PS2ClassicsGUIMod:
             name,
         )
         name = re.sub(r"[_\.]+", " ", name)
+        name = re.sub(
+            r"(?i)\s+(?:ISO(?:\s+BIN)?|BIN|ENC)(?:\s+(?:ISO|BIN|ENC))*$",
+            "",
+            name,
+        )
         name = re.sub(r"\s+", " ", name).strip(" -_")
         return name or Path(path).stem
 
@@ -3292,6 +4799,7 @@ class PS2ClassicsGUIMod:
 
         source_path = Path(source_text)
         candidates = [
+            source_path.with_suffix(".EDAT"),
             source_path.parent / "ISO.BIN.EDAT",
             source_path.with_name("ISO.BIN.EDAT"),
             source_path.parent.parent / "USRDIR" / "ISO.BIN.EDAT",
@@ -3355,13 +4863,35 @@ class PS2ClassicsGUIMod:
             return self.disc_id_from_edat_payload(output.read_bytes())
 
     def find_nearby_sfo_values(self, source):
-        sfo = self.find_nearby_file(source, "PARAM.SFO")
-        if not sfo:
-            return {}
-        try:
-            return self.sfo_to_values(sfo)
-        except Exception:
-            return {}
+        source = Path(source)
+        candidates = []
+
+        if self.source_is_encrypted(source):
+            candidates.append(self.encrypted_companion_sfo_path(source))
+
+        candidates.append(source.parent / "PARAM.SFO")
+        nearby = self.find_nearby_file(source, "PARAM.SFO")
+        if nearby:
+            candidates.append(nearby)
+
+        seen = set()
+        for sfo in candidates:
+            try:
+                resolved = str(Path(sfo).resolve())
+            except OSError:
+                resolved = str(sfo)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            if not Path(sfo).is_file():
+                continue
+            try:
+                return self.sfo_to_values(sfo)
+            except Exception:
+                continue
+
+        return {}
 
     def get_placeholder_identity(self):
         """Read the original GUI placeholder identity from PS2U10000."""
@@ -3407,9 +4937,11 @@ class PS2ClassicsGUIMod:
             return
 
         source = Path(source_text)
-        encrypted_mode = self.input_mode.get() == "encrypted"
+        encrypted_mode = self.source_is_encrypted(source)
         individual_mode = (
-            not encrypted_mode and self.create_individual_edat.get()
+            self.input_mode.get() == "package"
+            and not encrypted_mode
+            and self.create_individual_edat.get()
         )
         sfo_values = self.find_nearby_sfo_values(source)
         disc_id = None
@@ -3426,7 +4958,7 @@ class PS2ClassicsGUIMod:
                 except Exception as error:
                     self.log(f"EDAT metadata warning: {error}")
             if not disc_id:
-                disc_id = self.detect_disc_id(source)
+                disc_id = self.normalize_disc_id(source.name)
         else:
             disc_id = self.detect_disc_id(source)
 
@@ -3445,6 +4977,14 @@ class PS2ClassicsGUIMod:
                 title = source.parent.parent.name
             else:
                 title = self.clean_title_from_path(source)
+
+        if self.input_mode.get() == "encrypt_only":
+            if title:
+                self.game_title.set(title)
+            self.schedule_preview()
+            self.reset_compatibility_display()
+            self.schedule_build_readiness()
+            return
 
         if encrypted_mode:
             edat_content_id = content_id
@@ -3492,7 +5032,7 @@ class PS2ClassicsGUIMod:
 
         self.populate_default_asset_fields()
         self.schedule_preview()
-        self.schedule_compatibility_check()
+        self.reset_compatibility_display()
         self.schedule_build_readiness()
 
     def asset_search_score(self, candidate, asset_name):
@@ -3517,41 +5057,45 @@ class PS2ClassicsGUIMod:
         return score
 
     def find_asset_fallback(self, asset_name):
-        candidates = []
-        covers = self.script_dir / "PS2Covers"
-        template = self.find_template_dir()
+        candidates = self._asset_candidate_cache.get(asset_name)
 
-        direct_candidates = [
-            covers / asset_name,
-            self.script_dir / asset_name,
-        ]
-        if template:
-            direct_candidates.append(template / asset_name)
+        if candidates is None:
+            candidates = []
+            covers = self.script_dir / "PS2Covers"
+            template = self.find_template_dir()
 
-        for candidate in direct_candidates:
-            if candidate.is_file():
-                candidates.append(candidate)
+            direct_candidates = [
+                covers / asset_name,
+                self.script_dir / asset_name,
+            ]
+            if template:
+                direct_candidates.append(template / asset_name)
 
-        if covers.is_dir():
-            try:
-                for candidate in covers.rglob("*"):
-                    if (
-                        candidate.is_file()
-                        and candidate.name.upper() == asset_name.upper()
-                    ):
-                        candidates.append(candidate)
-            except OSError:
-                pass
+            for candidate in direct_candidates:
+                if candidate.is_file():
+                    candidates.append(candidate)
+
+            if covers.is_dir():
+                try:
+                    for candidate in covers.rglob("*"):
+                        if (
+                            candidate.is_file()
+                            and candidate.name.upper() == asset_name.upper()
+                        ):
+                            candidates.append(candidate)
+                except OSError:
+                    pass
+
+            candidates = list(dict.fromkeys(candidates))
+            self._asset_candidate_cache[asset_name] = candidates
 
         if not candidates:
             return None
 
-        candidates = list(dict.fromkeys(candidates))
-        candidates.sort(
+        return max(
+            candidates,
             key=lambda item: self.asset_search_score(item, asset_name),
-            reverse=True,
         )
-        return candidates[0]
 
     def resolve_asset_path(self, asset_name, selected_text=None):
         # Empty fields intentionally disable the visible asset.
@@ -3670,6 +5214,476 @@ class PS2ClassicsGUIMod:
         y = (size[1] - fitted.height) // 2
         result.alpha_composite(fitted, (x, y))
         return result
+
+    def find_miniplayer(self):
+        expected = self.script_dir / "player" / "MiniPlayer.exe"
+        if expected.is_file():
+            self._miniplayer_path = str(expected)
+            return self._miniplayer_path
+
+        self._miniplayer_path = None
+        return None
+
+    def download_at3_player(self):
+        if self.player_download_running:
+            return
+
+        confirmed = messagebox.askyesno(
+            "Download AT3 preview player",
+            (
+                "Download the third-party MiniPlayer.exe from "
+                "BenMitnicK/AT9-AT3_Converter on GitHub?\n\n"
+                "It will be saved to the local player folder and is used "
+                "only for optional SND0.AT3 preview playback."
+            ),
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        self.player_download_running = True
+        self.audio_player_download_button.pack_forget()
+        self.audio_player_download_progress.pack(fill="both", expand=True)
+        self.audio_player_download_progress.start(12)
+
+        worker = threading.Thread(
+            target=self._download_at3_player_worker,
+            daemon=True,
+        )
+        worker.start()
+
+    def _download_at3_player_worker(self):
+        try:
+            player_dir = self.script_dir / "player"
+            player_dir.mkdir(parents=True, exist_ok=True)
+            destination = player_dir / "MiniPlayer.exe"
+            temporary = player_dir / "MiniPlayer.exe.download"
+
+            try:
+                download_errors = []
+                data = None
+                for url in self.AT3_PLAYER_DOWNLOAD_URLS:
+                    try:
+                        candidate = self._urlopen_bytes(url, timeout=45)
+                        if len(candidate) < 1024 or candidate[:2] != b"MZ":
+                            raise RuntimeError(
+                                "The downloaded file is not a valid Windows executable."
+                            )
+                        data = candidate
+                        break
+                    except Exception as error:
+                        download_errors.append(str(error))
+
+                if data is None:
+                    raise RuntimeError(
+                        "All MiniPlayer download sources failed.\n"
+                        + "\n".join(download_errors[-2:])
+                    )
+
+                temporary.write_bytes(data)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+            self.player_download_queue.put(("done", str(destination)))
+        except Exception as error:
+            self.player_download_queue.put(("error", str(error)))
+
+    def poll_player_download_queue(self):
+        try:
+            while True:
+                event = self.player_download_queue.get_nowait()
+                self.player_download_running = False
+                self.audio_player_download_progress.stop()
+                self.audio_player_download_progress.pack_forget()
+                if not self.audio_player_download_button.winfo_manager():
+                    self.audio_player_download_button.pack(fill="both", expand=True)
+                self.audio_player_download_button.configure(
+                    text="Download player",
+                    state=tk.NORMAL,
+                )
+
+                if event[0] == "done":
+                    self._miniplayer_path = event[1]
+                    self.log(f"AT3 preview player downloaded: {event[1]}")
+                    self.schedule_preview()
+                    continue
+
+                self.log(f"AT3 preview player download failed: {event[1]}")
+                messagebox.showerror(
+                    "AT3 preview player",
+                    (
+                        f"Could not download MiniPlayer.exe.\n\n{event[1]}\n\n"
+                        "The upstream project can be opened in your browser instead."
+                    ),
+                    parent=self.root,
+                )
+                webbrowser.open_new_tab(self.AT3_PLAYER_REPO_URL)
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(150, self.poll_player_download_queue)
+        except tk.TclError:
+            pass
+
+    def find_ffplay(self):
+        if self._ffplay_path and Path(self._ffplay_path).is_file():
+            return self._ffplay_path
+        if self._ffplay_checked:
+            return None
+
+        candidates = (
+            self.script_dir / "player" / "ffplay.exe",
+            self.script_dir / "ffplay.exe",
+        )
+        self._ffplay_path = next(
+            (str(path) for path in candidates if path.is_file()),
+            None,
+        ) or shutil.which("ffplay")
+        self._ffplay_checked = True
+        return self._ffplay_path
+
+    def find_ffmpeg(self):
+        if self._ffmpeg_path and Path(self._ffmpeg_path).is_file():
+            return self._ffmpeg_path
+        if self._ffmpeg_checked:
+            return None
+
+        candidates = (
+            self.script_dir / "player" / "ffmpeg.exe",
+            self.script_dir / "ffmpeg.exe",
+        )
+        self._ffmpeg_path = next(
+            (str(path) for path in candidates if path.is_file()),
+            None,
+        ) or shutil.which("ffmpeg")
+        self._ffmpeg_checked = True
+        return self._ffmpeg_path
+
+    def audio_preview_backend(self):
+        miniplayer = self.find_miniplayer()
+        if miniplayer:
+            return ("miniplayer", miniplayer)
+
+        ffplay = self.find_ffplay()
+        if ffplay:
+            return ("ffplay", ffplay)
+
+        ffmpeg = self.find_ffmpeg()
+        if ffmpeg and winsound is not None:
+            return ("ffmpeg", ffmpeg)
+
+        return (None, None)
+
+    def stop_audio_preview(self):
+        self.audio_preview_request_id += 1
+
+        if self.audio_preview_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.audio_preview_poll_after_id)
+            except tk.TclError:
+                pass
+            self.audio_preview_poll_after_id = None
+
+        process = self.audio_preview_process
+        self.audio_preview_process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, 0)
+            except RuntimeError:
+                pass
+
+        temp_wav = self.audio_preview_temp_wav
+        self.audio_preview_temp_wav = None
+        if temp_wav:
+            try:
+                Path(temp_wav).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self.audio_preview_muted = True
+        if hasattr(self, "audio_preview_button"):
+            snd0_text = self.snd0_path.get().strip()
+            self.audio_preview_button.configure(
+                text=(
+                    "Play"
+                    if snd0_text and Path(snd0_text).is_file()
+                    else "Choose SND0"
+                ),
+                state=tk.NORMAL,
+            )
+
+    def poll_audio_preview(self):
+        self.audio_preview_poll_after_id = None
+        process = self.audio_preview_process
+        if process is None:
+            return
+        if process.poll() is not None:
+            self.audio_preview_process = None
+            self.audio_preview_muted = True
+            self.audio_preview_button.configure(text="Play")
+            self.schedule_preview()
+            return
+        try:
+            self.audio_preview_poll_after_id = self.root.after(
+                500,
+                self.poll_audio_preview,
+            )
+        except tk.TclError:
+            self.audio_preview_poll_after_id = None
+
+    def _ffmpeg_audio_worker(
+        self,
+        request_id,
+        ffmpeg,
+        snd0_text,
+        wav_path,
+    ):
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            if os.name == "nt"
+            else 0
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    snd0_text,
+                    "-vn",
+                    "-acodec",
+                    "pcm_s16le",
+                    wav_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                check=False,
+            )
+            if completed.returncode != 0 or not Path(wav_path).is_file():
+                raise RuntimeError("FFmpeg could not decode the selected AT3 file.")
+            self.audio_preview_queue.put(
+                ("ready", request_id, wav_path)
+            )
+        except Exception as error:
+            self.audio_preview_queue.put(
+                ("error", request_id, str(error))
+            )
+
+    def poll_audio_preview_queue(self):
+        try:
+            while True:
+                event = self.audio_preview_queue.get_nowait()
+                event_type, request_id = event[0], event[1]
+                if request_id != self.audio_preview_request_id:
+                    if event_type == "ready":
+                        try:
+                            Path(event[2]).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    continue
+
+                if event_type == "error":
+                    self.audio_preview_muted = True
+                    self.audio_preview_button.configure(
+                        text="Play",
+                        state=tk.NORMAL,
+                    )
+                    self.log(f"SND0 preview unavailable: {event[2]}")
+                    continue
+
+                wav_path = event[2]
+                self.audio_preview_temp_wav = wav_path
+                try:
+                    winsound.PlaySound(
+                        wav_path,
+                        winsound.SND_FILENAME
+                        | winsound.SND_ASYNC
+                        | winsound.SND_LOOP,
+                    )
+                    self.audio_preview_muted = False
+                    self.audio_preview_button.configure(
+                        text="Stop",
+                        state=tk.NORMAL,
+                    )
+                except Exception as error:
+                    self.audio_preview_muted = True
+                    self.audio_preview_button.configure(
+                        text="Play",
+                        state=tk.NORMAL,
+                    )
+                    self.log(f"SND0 preview could not be played: {error}")
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(120, self.poll_audio_preview_queue)
+        except tk.TclError:
+            pass
+
+    def audio_preview_button_action(self):
+        snd0_text = self.snd0_path.get().strip()
+        if not snd0_text or not Path(snd0_text).is_file():
+            self.browse_snd0()
+            return
+        self.toggle_audio_preview()
+
+    def toggle_audio_preview(self):
+        snd0_text = self.snd0_path.get().strip()
+        backend_name, backend_path = self.audio_preview_backend()
+        if not snd0_text or not Path(snd0_text).is_file() or not backend_name:
+            self.stop_audio_preview()
+            return
+
+        if not self.audio_preview_muted:
+            self.stop_audio_preview()
+            self.schedule_preview()
+            return
+
+        if backend_name == "miniplayer":
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW
+                if os.name == "nt"
+                else 0
+            )
+            try:
+                self.audio_preview_process = subprocess.Popen(
+                    [backend_path, snd0_text],
+                    cwd=str(Path(backend_path).parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                self.audio_preview_muted = False
+                self.audio_preview_button.configure(text="Stop")
+                self.poll_audio_preview()
+                self.schedule_preview()
+            except Exception as error:
+                self.stop_audio_preview()
+                self.log(f"SND0 MiniPlayer preview could not be started: {error}")
+            return
+
+        if backend_name == "ffplay":
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW
+                if os.name == "nt"
+                else 0
+            )
+            try:
+                self.audio_preview_process = subprocess.Popen(
+                    [
+                        backend_path,
+                        "-nodisp",
+                        "-loglevel",
+                        "quiet",
+                        "-loop",
+                        "0",
+                        "-autoexit",
+                        snd0_text,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                self.audio_preview_muted = False
+                self.audio_preview_button.configure(text="Stop")
+                self.poll_audio_preview()
+                self.schedule_preview()
+            except Exception as error:
+                self.stop_audio_preview()
+                self.log(f"SND0 preview could not be started: {error}")
+            return
+
+        self.audio_preview_request_id += 1
+        request_id = self.audio_preview_request_id
+        temp_dir = Path(tempfile.gettempdir())
+        wav_path = temp_dir / (
+            f"ps2_gui_snd0_{os.getpid()}_{request_id}.wav"
+        )
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        self.audio_preview_button.configure(
+            text="Loading...",
+            state=tk.DISABLED,
+        )
+        worker = threading.Thread(
+            target=self._ffmpeg_audio_worker,
+            args=(
+                request_id,
+                backend_path,
+                snd0_text,
+                str(wav_path),
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    def update_audio_preview_control(self):
+        if not hasattr(self, "audio_preview_button"):
+            return
+
+        snd0_text = self.snd0_path.get().strip()
+        has_snd0 = bool(snd0_text and Path(snd0_text).is_file())
+        backend_name, _backend_path = self.audio_preview_backend()
+
+        if not backend_name:
+            if not self.audio_preview_muted:
+                self.stop_audio_preview()
+            if not self.audio_player_hint_frame.winfo_manager():
+                self.audio_player_hint_frame.pack(
+                    fill="x",
+                    pady=(5, 0),
+                    before=self.github_link,
+                )
+        else:
+            if self.audio_player_hint_frame.winfo_manager():
+                self.audio_player_hint_frame.pack_forget()
+
+        if not has_snd0:
+            if not self.audio_preview_muted:
+                self.stop_audio_preview()
+            self.audio_preview_button.configure(
+                text="Choose SND0",
+                state=tk.NORMAL,
+            )
+        elif not backend_name:
+            self.audio_preview_button.configure(
+                text="Play",
+                state=tk.DISABLED,
+            )
+        else:
+            self.audio_preview_button.configure(
+                text="Play" if self.audio_preview_muted else "Stop",
+                state=tk.NORMAL,
+            )
+
+        self.preview_canvas.create_window(
+            8,
+            322,
+            window=self.audio_preview_button,
+            anchor="sw",
+        )
+
+    def on_snd0_changed(self):
+        self.stop_audio_preview()
+        self.schedule_preview()
 
     def update_live_preview(self):
         self._preview_after_id = None
@@ -3836,8 +5850,12 @@ class PS2ClassicsGUIMod:
             self.preview_info.config(
                 text="Preview: "
                 + (", ".join(selected) if selected else "no assets")
-                + "\nClick the title to edit it; click an image area to choose its asset."
+                + (
+                    "\nClick the title to edit it; click an image area or "
+                    "choose SND0 to select its asset."
+                )
             )
+            self.update_audio_preview_control()
 
         except Exception as error:
             self.preview_canvas.create_text(
@@ -3932,27 +5950,31 @@ class PS2ClassicsGUIMod:
         return None
 
     def find_tool_recursive(self, *names):
+        cache_key = tuple(sorted(name.lower() for name in names))
+        cached = self._tool_cache.get(cache_key)
+        if cached and Path(cached).is_file():
+            return Path(cached)
+
         wanted = {name.lower() for name in names}
 
         for name in names:
             candidate = self.script_dir / name
             if candidate.is_file():
+                self._tool_cache[cache_key] = str(candidate)
                 return candidate
 
         try:
             for candidate in self.script_dir.rglob("*"):
                 if not candidate.is_file():
                     continue
-
                 if candidate.name.lower() not in wanted:
                     continue
-
                 if any(
                     part.lower().startswith("ps2_classics_gui_mod_")
                     for part in candidate.parts
                 ):
                     continue
-
+                self._tool_cache[cache_key] = str(candidate)
                 return candidate
         except OSError:
             pass
@@ -3993,7 +6015,19 @@ class PS2ClassicsGUIMod:
             return None
 
         rap_name = content_id + ".rap"
-        preferred = (
+        source_text = self.iso_path.get().strip()
+        source_dir = Path(source_text).parent if source_text else None
+        nearby = []
+        if source_dir:
+            nearby.extend(
+                [
+                    source_dir / rap_name,
+                    source_dir / "exdata" / rap_name,
+                    source_dir / "EXDATA" / rap_name,
+                ]
+            )
+
+        preferred = tuple(nearby) + (
             self.script_dir / rap_name,
             self.script_dir / "exdata" / rap_name,
             self.script_dir / "EXDATA" / rap_name,
@@ -4028,7 +6062,7 @@ class PS2ClassicsGUIMod:
         )
 
     def refresh_disc_id_cache(self):
-        if self.input_mode.get() == "encrypted":
+        if self.source_is_encrypted():
             value = self.detected_disc_id.get().strip()
             return value or None
 
@@ -4115,46 +6149,186 @@ class PS2ClassicsGUIMod:
     def get_build_requirements(self):
         source_text = self.iso_path.get().strip()
         output_text = self.output_dir.get().strip()
-        content_id = self.content_id.get().strip().upper()
-        title_id = self.title_id.get().strip().upper()
-        version = self.version.get().strip()
-        klicensee = re.sub(r"\s+", "", self.klicensee.get())
-        encrypted_mode = self.input_mode.get() == "encrypted"
-        individual_mode = (
-            not encrypted_mode and self.create_individual_edat.get()
-        )
-
         source_path = Path(source_text) if source_text else None
         source_ok = bool(source_path and source_path.is_file())
-        disc_id = self.refresh_disc_id_cache() if source_ok else None
-        edat_game_id = self.format_edat_game_id(disc_id)
-        sidecar_edat = self.find_sidecar_edat(source_path) if source_ok else None
+        encrypted_source = bool(
+            source_ok and self.source_is_encrypted(source_path)
+        )
+        package_mode = self.input_mode.get() == "package"
 
         output_ok = False
         if output_text:
             output_path = Path(output_text)
             output_ok = output_path.is_dir() or output_path.parent.is_dir()
 
-        expected_title_id = self.content_id_title_id(content_id)
-        make_npdata = self.find_make_npdata()
+        klicensee = re.sub(r"\s+", "", self.klicensee.get())
         ps2classic = self.find_tool_recursive("ps2classic.exe")
+
+        key_ok = bool(
+            re.fullmatch(r"[0-9A-Fa-f]{32}", klicensee)
+            or (
+                getattr(self, "ps2_key_source_file", None)
+                and Path(self.ps2_key_source_file).is_file()
+            )
+            or self.get_ps2_key_generation_source()
+        )
+
+        ps2_key_ok = bool(
+            self.valid_ps2_key_file()
+            or (
+                self.create_project_ps2_key.get()
+                and key_ok
+            )
+        )
+
+        requirements = [
+            ("Build source", source_ok, source_text or "not selected"),
+            ("Output folder", output_ok, output_text or "not selected"),
+            (
+                "Klicensee",
+                key_ok,
+                str(self.ps2_klicensee_source or "manual/generated key")
+                if key_ok
+                else "no usable local key source",
+            ),
+            (
+                "ps2.key",
+                ps2_key_ok,
+                str(self.ps2_key_file)
+                if self.valid_ps2_key_file()
+                else str(self.script_dir / "ps2.key"),
+            ),
+        ]
+
+        if not package_mode:
+            requirements.append(
+                (
+                    "ps2classic.exe",
+                    bool(ps2classic),
+                    str(ps2classic or "missing"),
+                )
+            )
+            requirements.append(
+                (
+                    "Raw source image",
+                    source_ok and not encrypted_source,
+                    (
+                        "ready for encryption"
+                        if source_ok and not encrypted_source
+                        else "Just encrypt mode does not accept an existing *.ENC file"
+                    ),
+                )
+            )
+            placeholder = self.get_placeholder_identity()
+            placeholder_content_id = str(
+                placeholder.get("content_id", "")
+            ).strip().upper()
+            requirements.append(
+                (
+                    "Universal PS2 Classics identity",
+                    self.valid_content_id(placeholder_content_id),
+                    placeholder_content_id
+                    or "PS2U10000/USRDIR/ISO.BIN.EDAT is unavailable",
+                )
+            )
+
+            if self.encrypt_only_create_edat.get():
+                disc_id = self.detected_disc_id.get().strip() if source_ok else None
+                expected_game_id = self.format_edat_game_id(disc_id)
+                make_npdata = self.find_make_npdata()
+                placeholder_rap = self.find_placeholder_rap()
+                requirements.extend(
+                    [
+                        (
+                            "PS2 disc ID for EDAT",
+                            bool(expected_game_id),
+                            expected_game_id or "could not be detected",
+                        ),
+                        (
+                            "make_npdata.exe for EDAT",
+                            bool(make_npdata),
+                            str(make_npdata or "not available"),
+                        ),
+                        (
+                            "RAP for EDAT",
+                            bool(placeholder_rap),
+                            str(placeholder_rap or "matching placeholder RAP not found"),
+                        ),
+                    ]
+                )
+            elif self.encrypt_only_copy_rap.get():
+                placeholder_rap = self.find_placeholder_rap()
+                requirements.append(
+                    (
+                        "RAP",
+                        bool(placeholder_rap),
+                        str(placeholder_rap or "matching placeholder RAP not found"),
+                    )
+                )
+
+            if self.encrypt_vmc.get():
+                vmc_text = self.vmc_path.get().strip()
+                vmc_ok = bool(vmc_text and Path(vmc_text).is_file())
+                requirements.append(
+                    (
+                        "VMC file",
+                        vmc_ok,
+                        vmc_text or "VMC encryption is enabled but no file is selected",
+                    )
+                )
+            return requirements
+
+        content_id = self.content_id.get().strip().upper()
+        title_id = self.title_id.get().strip().upper()
+        version = self.version.get().strip()
+        individual_mode = (
+            not encrypted_source and self.create_individual_edat.get()
+        )
+
+        disc_id = self.detected_disc_id.get().strip() if source_ok else None
+        edat_game_id = self.format_edat_game_id(disc_id)
+        sidecar_edat = (
+            self.find_sidecar_edat(source_path)
+            if source_ok and encrypted_source
+            else None
+        )
+
+        make_npdata = self.find_make_npdata()
         pkg_tool = self.find_pkg_tool()
         template = self.find_template_dir()
-        placeholder = self.get_placeholder_identity() if template else {}
         placeholder_rap = self.find_placeholder_rap() if template else None
         custom_rap = self.find_rap_file(content_id) if individual_mode else None
         edat_rap = custom_rap if individual_mode else placeholder_rap
+
+        expected_title_id = self.content_id_title_id(content_id)
 
         manual_config = bool(
             self.param_hip_path.get().strip()
             and Path(self.param_hip_path.get().strip()).is_file()
         )
         ps2classic_required = (
-            not encrypted_mode or manual_config or self.encrypt_vmc.get()
+            not encrypted_source
+            or manual_config
+            or self.encrypt_vmc.get()
+        )
+        requirements.append(
+            (
+                "ps2classic.exe",
+                bool(ps2classic) if ps2classic_required else True,
+                str(
+                    ps2classic
+                    or (
+                        "not required for this existing-ENC package build"
+                        if not ps2classic_required
+                        else "missing"
+                    )
+                ),
+            )
         )
 
         selected_package_icon = self.resolve_asset_path(
-            "ICON0.PNG", self.icon0_path.get().strip()
+            "ICON0.PNG",
+            self.icon0_path.get().strip(),
         )
         template_package_icon = (
             template / "ICON0.PNG" if template else None
@@ -4165,57 +6339,42 @@ class PS2ClassicsGUIMod:
             else None
         )
 
-        requirements = [
-            ("Build source", source_ok, source_text or "not selected"),
-            (
-                "Source mode",
-                True,
-                "existing ISO.BIN.ENC" if encrypted_mode else "raw PS2 image",
-            ),
-        ]
-
-        if encrypted_mode:
-            edat_ok = bool(sidecar_edat and sidecar_edat.is_file())
+        if encrypted_source:
             requirements.append(
                 (
-                    "ISO.BIN.EDAT sidecar",
-                    edat_ok,
-                    str(sidecar_edat or "not found next to ISO.BIN.ENC"),
+                    "ISO.BIN.EDAT",
+                    bool(sidecar_edat and sidecar_edat.is_file()),
+                    str(sidecar_edat or "required next to/for the selected *.ENC image"),
                 )
             )
         else:
-            requirements.append(
-                (
-                    "PS2 disc ID",
-                    bool(edat_game_id),
-                    edat_game_id or "could not be detected",
-                )
-            )
-            requirements.append(
-                (
-                    "EDAT creation",
-                    bool(make_npdata and edat_rap),
+            requirements.extend(
+                [
                     (
-                        "custom package identity via "
-                        + str(custom_rap or "missing matching RAP")
-                        if individual_mode
-                        else (
-                            "universal PS2 Classics identity via "
-                            + str(placeholder_rap or "missing placeholder RAP")
-                        )
+                        "PS2 disc ID",
+                        bool(edat_game_id),
+                        edat_game_id or "could not be detected",
                     ),
-                )
+                    (
+                        "EDAT creation",
+                        bool(make_npdata and edat_rap),
+                        (
+                            "custom package identity via "
+                            + str(custom_rap or "missing matching RAP")
+                            if individual_mode
+                            else (
+                                "universal PS2 Classics identity via "
+                                + str(placeholder_rap or "missing placeholder RAP")
+                            )
+                        ),
+                    ),
+                    (
+                        "make_npdata.exe",
+                        bool(make_npdata),
+                        str(make_npdata or "required to create ISO.BIN.EDAT"),
+                    ),
+                ]
             )
-            requirements.append(
-                (
-                    "make_npdata.exe",
-                    bool(make_npdata),
-                    str(make_npdata or "required to create ISO.BIN.EDAT"),
-                )
-            )
-
-        content_ok = self.valid_content_id(content_id)
-        content_details = content_id or "not discovered/generated"
 
         requirements.extend(
             [
@@ -4227,13 +6386,16 @@ class PS2ClassicsGUIMod:
                         or "no manual, PS2Covers, program or template fallback"
                     ),
                 ),
-                ("Output folder", output_ok, output_text or "not selected"),
                 (
                     "Game title",
                     bool(self.game_title.get().strip()),
                     self.game_title.get().strip() or "not discovered",
                 ),
-                ("Package Content ID", content_ok, content_details),
+                (
+                    "Package Content ID",
+                    self.valid_content_id(content_id),
+                    content_id or "not discovered/generated",
+                ),
                 (
                     "Title ID",
                     bool(expected_title_id) and title_id == expected_title_id,
@@ -4247,119 +6409,6 @@ class PS2ClassicsGUIMod:
                     version or "not discovered/generated",
                 ),
                 (
-                    "Klicensee",
-                    bool(
-                        re.fullmatch(r"[0-9A-Fa-f]{32}", klicensee)
-                        or (
-                            getattr(self, "ps2_key_source_file", None)
-                            and Path(self.ps2_key_source_file).is_file()
-                        )
-                        or self.get_ps2_key_generation_source()
-                    ),
-                    (
-                        str(self.ps2_klicensee_source or "manual field")
-                        if re.fullmatch(r"[0-9A-Fa-f]{32}", klicensee)
-                        else (
-                            str(self.ps2_key_source_file)
-                            if (
-                                getattr(
-                                    self,
-                                    "ps2_key_source_file",
-                                    None,
-                                )
-                                and Path(
-                                    self.ps2_key_source_file
-                                ).is_file()
-                            )
-                            else (
-                                "generated from the matching placeholder RAP"
-                                if self.get_ps2_key_generation_source()
-                                else "no usable local key source"
-                            )
-                        )
-                    ),
-                ),
-                (
-                    "ps2.key",
-                    bool(
-                        self.valid_ps2_key_file()
-                        or (
-                            self.create_project_ps2_key.get()
-                            and (
-                                re.fullmatch(
-                                    r"[0-9A-Fa-f]{32}",
-                                    klicensee,
-                                )
-                                or (
-                                    getattr(
-                                        self,
-                                        "ps2_key_source_file",
-                                        None,
-                                    )
-                                    and Path(
-                                        self.ps2_key_source_file
-                                    ).is_file()
-                                )
-                                or self.get_ps2_key_generation_source()
-                            )
-                        )
-                    ),
-                    (
-                        str(self.ps2_key_file)
-                        if self.valid_ps2_key_file()
-                        and not self.create_project_ps2_key.get()
-                        else (
-                            (
-                                str(self.script_dir / "ps2.key")
-                                + " will be generated from the placeholder RAP"
-                            )
-                            if self.get_ps2_key_generation_source()
-                            else (
-                                str(self.script_dir / "ps2.key")
-                                + " will be created from the Klicensee field"
-                            )
-                        )
-                    ),
-                ),
-                (
-                    "ps2classic.exe",
-                    bool(ps2classic) if ps2classic_required else True,
-                    str(
-                        ps2classic
-                        or (
-                            "not required for this package-only build"
-                            if not ps2classic_required
-                            else "missing"
-                        )
-                    ),
-                ),
-                (
-                    "make_npdata.exe",
-                    bool(make_npdata) if individual_mode else True,
-                    str(
-                        make_npdata
-                        or (
-                            "optional in placeholder/existing-EDAT mode"
-                            if not individual_mode
-                            else "missing"
-                        )
-                    ),
-                ),
-                (
-                    "RAP license",
-                    bool(self.find_rap_file(content_id))
-                    if individual_mode
-                    else True,
-                    (
-                        str(
-                            self.find_rap_file(content_id)
-                            or "matching RAP missing from root/exdata"
-                        )
-                        if individual_mode
-                        else "not required for placeholder packaging"
-                    ),
-                ),
-                (
                     "PS2 package template",
                     template is not None,
                     str(template or "PARAM.SFO or USRDIR is missing"),
@@ -4371,6 +6420,17 @@ class PS2ClassicsGUIMod:
                 ),
             ]
         )
+
+        if individual_mode:
+            requirements.extend(
+                [
+                    (
+                        "Game-specific RAP",
+                        bool(custom_rap),
+                        str(custom_rap or "matching RAP missing from root/exdata"),
+                    ),
+                ]
+            )
 
         if self.encrypt_vmc.get():
             vmc_ok = Path(self.vmc_path.get().strip()).is_file()
@@ -4402,9 +6462,14 @@ class PS2ClassicsGUIMod:
         )
 
         if not self.building:
+            ready_text = (
+                "MAKE PKG"
+                if self.input_mode.get() == "package"
+                else "ENCRYPT ISO"
+            )
             self.build_button.configure(
                 state=tk.NORMAL if ready else tk.DISABLED,
-                text="MAKE PKG" if ready else "MAKE PKG · Missing requirements",
+                text=ready_text if ready else "Missing requirements",
             )
 
         return ready
@@ -4645,14 +6710,24 @@ class PS2ClassicsGUIMod:
         sfo_path = Path(sfo_path)
         version, entries = self.read_param_sfo(sfo_path)
 
+        # Match the compact PS2 Classics SFO layout used by known-good builds.
+        # APP_VER/VERSION stay in package.conf and are not stored in PARAM.SFO.
+        entries = [
+            entry
+            for entry in entries
+            if entry["key"] not in {"APP_VER", "VERSION"}
+        ]
+
         updates = dict(updates)
         title = str(updates.get("TITLE", "")).strip()
+
+        # Keep the original SFO layout whenever possible. Some templates may
+        # already contain localized TITLE_xx fields; update those in place, but
+        # never add new language slots to a template that did not have them.
         if title:
-            # PS3 HDD content can use localized TITLE_xx fields. Mirror the
-            # selected title into all PS3 language slots to avoid stale/template
-            # localized names overriding the default TITLE on the XMB.
-            for language_index in range(20):
-                updates[f"TITLE_{language_index:02d}"] = title
+            for entry in entries:
+                if re.fullmatch(r"TITLE_[0-9]{2}", entry["key"]):
+                    updates[entry["key"]] = title
 
         by_key = {entry["key"]: entry for entry in entries}
         changed = []
@@ -4672,16 +6747,26 @@ class PS2ClassicsGUIMod:
 
                 entry["raw"] = encoded
                 entry["length"] = len(encoded)
+                required_max = (
+                    0x80
+                    if key == "TITLE" or re.fullmatch(r"TITLE_[0-9]{2}", key)
+                    else self._align(len(encoded), 4)
+                )
                 entry["max_length"] = max(
                     int(entry["max_length"]),
-                    self._align(len(encoded), 4),
+                    required_max,
                 )
             else:
+                required_max = (
+                    0x80
+                    if key == "TITLE" or re.fullmatch(r"TITLE_[0-9]{2}", key)
+                    else max(8, self._align(len(encoded), 4))
+                )
                 entry = {
                     "key": key,
                     "format": 0x0204,
                     "length": len(encoded),
-                    "max_length": max(8, self._align(len(encoded), 4)),
+                    "max_length": required_max,
                     "raw": encoded,
                 }
                 entries.append(entry)
@@ -4723,7 +6808,6 @@ class PS2ClassicsGUIMod:
             "TITLE",
             "TITLE_ID",
             "CATEGORY",
-            "VERSION",
         }
         missing = sorted(required_keys - verify_keys)
 
@@ -4738,7 +6822,7 @@ class PS2ClassicsGUIMod:
             + ", ".join(dict.fromkeys(changed))
         )
         self.log(
-            "PARAM.SFO check: VERSION is present and CATEGORY = 2P."
+            "PARAM.SFO check: compact PS2 Classics layout and CATEGORY = 2P."
         )
 
     @staticmethod
@@ -4785,8 +6869,26 @@ class PS2ClassicsGUIMod:
 
         return None
 
+    def detect_image_type_value(self, image_path):
+        """Return the exact image-type radio value without touching Tk state."""
+        sector_size = self.detect_image_sector_size(image_path)
+
+        if sector_size == 2352:
+            return (
+                "CD",
+                "Auto-detected: 2352-byte raw CD sectors. Manual override allowed.",
+            )
+
+        if sector_size == 2048:
+            return (
+                "DVD5 / DVD9",
+                "Auto-detected: 2048-byte sectors. Manual override allowed.",
+            )
+
+        return None
+
     def auto_detect_image_type(self, image_path):
-        if self.input_mode.get() != "raw":
+        if self.source_is_encrypted(image_path):
             self.image_type_detection.set("")
             return None
 
@@ -4839,49 +6941,190 @@ class PS2ClassicsGUIMod:
 
         return f"{match.group(1)}_{match.group(2)}.{match.group(3)}"
 
+    @staticmethod
+    def _read_iso_logical_bytes(
+        handle,
+        sector_size,
+        user_offset,
+        lba,
+        length,
+    ):
+        output = bytearray()
+        remaining = int(length)
+        current_lba = int(lba)
+
+        while remaining > 0:
+            handle.seek(current_lba * sector_size + user_offset)
+            chunk = handle.read(min(0x800, remaining))
+            if not chunk:
+                break
+            output.extend(chunk)
+            remaining -= len(chunk)
+            current_lba += 1
+
+        return bytes(output)
+
+    def detect_disc_id_from_iso9660(self, image_path):
+        """Read SYSTEM.CNF through the ISO9660 root directory when possible."""
+        image_path = Path(image_path)
+
+        try:
+            with image_path.open("rb") as handle:
+                for sector_size in (0x800, 0x930):
+                    pvd_sector_offset = 16 * sector_size
+                    handle.seek(pvd_sector_offset)
+                    probe = handle.read(64)
+                    user_offset = None
+
+                    for candidate_offset in (0, 16, 24):
+                        if (
+                            probe[
+                                candidate_offset:
+                                candidate_offset + 6
+                            ]
+                            == b"\x01CD001"
+                        ):
+                            user_offset = candidate_offset
+                            break
+
+                    if user_offset is None:
+                        continue
+
+                    handle.seek(pvd_sector_offset + user_offset)
+                    pvd = handle.read(0x800)
+                    if len(pvd) < 190 or pvd[:6] != b"\x01CD001":
+                        continue
+
+                    root_length = pvd[156]
+                    if root_length < 34:
+                        continue
+
+                    root_record = pvd[156:156 + root_length]
+                    root_lba = int.from_bytes(
+                        root_record[2:6],
+                        "little",
+                    )
+                    root_size = int.from_bytes(
+                        root_record[10:14],
+                        "little",
+                    )
+                    if root_lba <= 0 or root_size <= 0:
+                        continue
+
+                    directory = self._read_iso_logical_bytes(
+                        handle,
+                        sector_size,
+                        user_offset,
+                        root_lba,
+                        min(root_size, 1024 * 1024),
+                    )
+
+                    position = 0
+                    while position < len(directory):
+                        record_length = directory[position]
+                        if record_length == 0:
+                            position = (
+                                (position // 0x800) + 1
+                            ) * 0x800
+                            continue
+
+                        record = directory[
+                            position:
+                            position + record_length
+                        ]
+                        position += record_length
+
+                        if len(record) < 34:
+                            continue
+
+                        name_length = record[32]
+                        name_raw = record[33:33 + name_length]
+                        name = name_raw.decode(
+                            "ascii",
+                            errors="ignore",
+                        ).split(";", 1)[0].upper()
+
+                        if name != "SYSTEM.CNF":
+                            continue
+
+                        file_lba = int.from_bytes(
+                            record[2:6],
+                            "little",
+                        )
+                        file_size = int.from_bytes(
+                            record[10:14],
+                            "little",
+                        )
+                        if file_lba <= 0 or file_size <= 0:
+                            break
+
+                        system_cnf = self._read_iso_logical_bytes(
+                            handle,
+                            sector_size,
+                            user_offset,
+                            file_lba,
+                            min(file_size, 64 * 1024),
+                        )
+                        text = system_cnf.decode(
+                            "ascii",
+                            errors="ignore",
+                        )
+                        detected = self.normalize_disc_id(text)
+                        if detected:
+                            return detected
+
+        except OSError:
+            return None
+
+        return None
+
     def detect_disc_id(self, image_path):
-        """Detect the disc ID from the filename or the first 128 MiB."""
+        """Detect the disc ID from filename, SYSTEM.CNF, or a small fallback scan."""
         image_path = Path(image_path)
 
         detected = self.normalize_disc_id(image_path.name)
         if detected:
             return detected
 
-        pattern = re.compile(
-            rb"(SLUS|SLES|SCUS|SCES|SLPM|SLPS|SCPS|SCAJ|SCKA|"
-            rb"SCED|TCES|TCUS|PBPX|PAPX|PCPX|SCCS)"
-            rb"[^0-9]{0,4}([0-9]{3})[^0-9]{0,3}([0-9]{2})",
-            re.IGNORECASE,
-        )
+        detected = self.detect_disc_id_from_iso9660(image_path)
+        if detected:
+            return detected
 
-        max_read = 128 * 1024 * 1024
-        chunk_size = 4 * 1024 * 1024
-        read_total = 0
-        overlap = b""
+        # Small fallback scan for unusual images. Use byte searches for the
+        # known serial prefixes and apply regex only to tiny matching windows;
+        # scanning a large buffer with one Python regex can starve Tk's UI.
+        prefixes = (
+            b"SLUS", b"SLES", b"SCUS", b"SCES", b"SLPM", b"SLPS",
+            b"SCPS", b"SCAJ", b"SCKA", b"SCED", b"TCES", b"TCUS",
+            b"PBPX", b"PAPX", b"PCPX", b"SCCS",
+        )
+        serial_pattern = re.compile(
+            rb"([A-Z]{4})[^0-9]{0,4}([0-9]{3})[^0-9]{0,3}([0-9]{2})"
+        )
 
         try:
             with image_path.open("rb") as handle:
-                while read_total < max_read:
-                    chunk = handle.read(
-                        min(chunk_size, max_read - read_total)
-                    )
-                    if not chunk:
+                data = handle.read(16 * 1024 * 1024)
+
+            for prefix in prefixes:
+                position = 0
+                while True:
+                    index = data.find(prefix, position)
+                    if index < 0:
                         break
 
-                    haystack = overlap + chunk
-                    match = pattern.search(haystack)
-
+                    window = data[index:index + 32]
+                    match = serial_pattern.search(window)
                     if match:
-                        prefix = match.group(1).decode("ascii").upper()
+                        serial_prefix = match.group(1).decode("ascii")
                         number_a = match.group(2).decode("ascii")
                         number_b = match.group(3).decode("ascii")
-                        return f"{prefix}_{number_a}.{number_b}"
+                        return f"{serial_prefix}_{number_a}.{number_b}"
 
-                    overlap = haystack[-64:]
-                    read_total += len(chunk)
+                    position = index + len(prefix)
 
-        except OSError as error:
-            self.log(f"The disc ID could not be read: {error}")
+        except OSError:
+            return None
 
         return None
 
@@ -5535,11 +7778,40 @@ class PS2ClassicsGUIMod:
         verify_dir.mkdir(parents=True)
         pkg_info = self.read_pkg_index(pkg_path)
 
-        if pkg_info["content_id"] != package_content_id:
+        expected_package_content_id = self.generated_content_id(
+            expected_game_id,
+            expected_title_id,
+        )
+        if not expected_package_content_id:
             raise RuntimeError(
-                "The PKG header Content ID does not match.\n"
-                f"Expected: {package_content_id}\n"
-                f"Found: {pkg_info['content_id']}"
+                "The expected standalone package Content ID could not be generated."
+            )
+
+        configured_package_content_id = str(package_content_id).strip().upper()
+        header_package_content_id = str(pkg_info["content_id"]).strip().upper()
+
+        if configured_package_content_id != expected_package_content_id:
+            raise RuntimeError(
+                "The configured Package Content ID does not use the expected "
+                "standalone PS2 Classics identity.\n"
+                f"Expected: {expected_package_content_id}\n"
+                f"Configured: {configured_package_content_id}"
+            )
+
+        if header_package_content_id != expected_package_content_id:
+            raise RuntimeError(
+                "The PKG header Content ID does not match the expected "
+                "standalone PS2 Classics identity.\n"
+                f"Expected: {expected_package_content_id}\n"
+                f"Found: {header_package_content_id}"
+            )
+
+        header_title_id = self.content_id_title_id(header_package_content_id)
+        if header_title_id != expected_title_id.upper():
+            raise RuntimeError(
+                "The PKG header Content ID is not associated with TITLE_ID.\n"
+                f"Content ID Title ID: {header_title_id or 'not found'}\n"
+                f"PARAM.SFO TITLE_ID: {expected_title_id}"
             )
 
         if package_dir.name.upper() != expected_title_id.upper():
@@ -5580,9 +7852,17 @@ class PS2ClassicsGUIMod:
             "ICON0.PNG",
             "USRDIR/ISO.BIN.EDAT",
         ]
-        for optional_asset in ("PIC0.PNG", "PIC1.PNG"):
+        for optional_asset in ("PIC0.PNG", "PIC1.PNG", "SND0.AT3"):
             if optional_asset in entry_map:
                 verify_names.append(optional_asset)
+
+        snd0_source = package_dir / "SND0.AT3"
+        if snd0_source.is_file() and "SND0.AT3" not in entry_map:
+            raise RuntimeError(
+                "SND0.AT3 exists in the package source but is missing from the PKG."
+            )
+        if "SND0.AT3" in entry_map and entry_map["SND0.AT3"]["file_size"] == 0:
+            raise RuntimeError("SND0.AT3 inside the completed PKG is empty.")
 
         for name in verify_names:
             entry = entry_map[name.upper()]
@@ -5600,6 +7880,7 @@ class PS2ClassicsGUIMod:
             "ICON0.PNG": package_dir / "ICON0.PNG",
             "PIC0.PNG": package_dir / "PIC0.PNG",
             "PIC1.PNG": package_dir / "PIC1.PNG",
+            "SND0.AT3": package_dir / "SND0.AT3",
             "USRDIR/ISO.BIN.EDAT": (
                 package_dir / "USRDIR" / "ISO.BIN.EDAT"
             ),
@@ -5631,11 +7912,7 @@ class PS2ClassicsGUIMod:
             "TITLE_ID": expected_title_id,
             "CATEGORY": "2P",
             "BOOTABLE": "1",
-            "VERSION": expected_version,
         }
-
-        for language_index in range(20):
-            expected_sfo[f"TITLE_{language_index:02d}"] = expected_title
 
         for key, expected in expected_sfo.items():
             found = str(sfo_values.get(key, ""))
@@ -5645,6 +7922,15 @@ class PS2ClassicsGUIMod:
                     f"PARAM.SFO {key} does not match: "
                     f"{found!r} statt {expected!r}."
                 )
+
+        unexpected_version_fields = [
+            key for key in ("APP_VER", "VERSION") if key in sfo_values
+        ]
+        if unexpected_version_fields:
+            raise RuntimeError(
+                "PARAM.SFO contains unexpected PS2 Classics version fields: "
+                + ", ".join(unexpected_version_fields)
+            )
 
         self.verify_iso_bin_edat_header(
             extracted["USRDIR/ISO.BIN.EDAT"],
@@ -5679,15 +7965,20 @@ class PS2ClassicsGUIMod:
             f"PKG: {pkg_path}",
             f"PKG SHA-256: {self.sha256_file(pkg_path)}",
             f"Package Content ID: {pkg_info['content_id']}",
+            f"Expected Package Content ID: {expected_package_content_id}",
+            (
+                "Package identity: standalone PS2 Classics "
+                f"({expected_package_content_id[:6]})"
+            ),
             f"EDAT/ENC Content ID: {edat_content_id}",
             f"Install directory: {package_dir.name}",
             f"Entries: {pkg_info['item_count']}",
             f"TITLE: {sfo_values.get('TITLE')}",
-            f"TITLE_04: {sfo_values.get('TITLE_04')}",
             f"TITLE_ID: {sfo_values.get('TITLE_ID')}",
             f"CATEGORY: {sfo_values.get('CATEGORY')}",
             f"BOOTABLE: {sfo_values.get('BOOTABLE')}",
-            f"VERSION: {sfo_values.get('VERSION')}",
+            f"Package Version: {expected_version}",
+            "PARAM.SFO layout: compact PS2 Classics (no APP_VER/VERSION)",
             f"EDAT Payload: {expected_game_id or 'not decrypted'}",
             f"EDAT Payload Verified: {'Yes' if edat_payload_verified else 'No'}",
             f"ISO.BIN.ENC size: {enc_entry['file_size']}",
@@ -5711,6 +8002,15 @@ class PS2ClassicsGUIMod:
                     f"{asset_name}: SHA-256 {self.sha256_file(asset_path)}"
                 )
 
+        snd0_path = extracted.get("SND0.AT3")
+        if snd0_path:
+            report_lines.append(
+                f"SND0.AT3: {snd0_path.stat().st_size} bytes · "
+                f"SHA-256 {self.sha256_file(snd0_path)}"
+            )
+        else:
+            report_lines.append("SND0.AT3: omitted")
+
         report_lines.extend(["", "PKG file list:"])
 
         for entry in sorted(
@@ -5733,6 +8033,7 @@ class PS2ClassicsGUIMod:
             "Finished PKG reopened and verified:"
         )
         self.log(f"  Package Content ID: {pkg_info['content_id']}")
+        self.log(f"  Expected Package Content ID: {expected_package_content_id}")
         self.log(f"  EDAT/ENC Content ID: {edat_content_id}")
         self.log(f"  Install directory: {package_dir.name}")
         self.log(f"  PARAM.SFO: {expected_sfo}")
@@ -5942,7 +8243,261 @@ class PS2ClassicsGUIMod:
     # Build
     # -------------------------------------------------------
 
+    def encrypt_iso_only(self):
+        try:
+            self.validate_inputs()
+        except Exception as error:
+            messagebox.showerror(
+                "Encryption requirements",
+                str(error),
+                parent=self.root,
+            )
+            self.update_ps2_key_option_ui()
+            self.update_build_readiness()
+            return
+
+        self.log_box.delete("1.0", tk.END)
+        self.building = True
+        self.build_button.configure(
+            state=tk.DISABLED,
+            text="ENCRYPTING…",
+        )
+        self.set_progress(0)
+        self.set_status("Preparing encryption…")
+
+        work_dir = None
+        try:
+            build_key_hex = self.resolve_ps2_klicensee()
+            if (
+                not build_key_hex
+                and self.create_project_ps2_key.get()
+                and self.get_ps2_key_generation_source()
+            ):
+                generated_key = self.generate_project_ps2_key_from_rap()
+                build_key_hex = self.parse_klicensee(
+                    generated_key.read_bytes()
+                )
+
+            if not re.fullmatch(r"[0-9A-F]{32}", build_key_hex):
+                raise RuntimeError(
+                    "No valid PS2 Classics Klicensee could be resolved."
+                )
+
+            build_key_bytes = bytes.fromhex(build_key_hex)
+            if self.create_project_ps2_key.get():
+                self.write_project_ps2_key(build_key_bytes)
+
+            source_path = Path(self.iso_path.get().strip())
+            output_dir = Path(self.output_dir.get().strip())
+            output_dir.mkdir(parents=True, exist_ok=True)
+            target = self.target_type.get().lower()
+
+            placeholder_identity = self.get_placeholder_identity()
+            encryption_content_id = str(
+                placeholder_identity.get("content_id", "")
+            ).strip().upper()
+            if not self.valid_content_id(encryption_content_id):
+                raise RuntimeError(
+                    "The universal PS2 Classics Content ID could not be read "
+                    "from PS2U10000/USRDIR/ISO.BIN.EDAT."
+                )
+
+            ps2classic = self.find_tool_recursive("ps2classic.exe")
+            if not ps2classic:
+                raise RuntimeError("ps2classic.exe is required.")
+
+            work_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="ps2_encrypt_only_",
+                    dir=str(output_dir),
+                )
+            )
+            key_path = work_dir / "ps2.key"
+            klic_bin_path = work_dir / "klic.bin"
+            key_path.write_bytes(build_key_bytes)
+            klic_bin_path.write_bytes(build_key_bytes)
+
+            encrypt_input = source_path
+            if self.add_limg.get():
+                encrypt_input = work_dir / (
+                    source_path.stem + "_LIMG" + source_path.suffix
+                )
+                self.create_limg_copy(source_path, encrypt_input)
+
+            safe_stem = self.safe_filename_component(
+                source_path.stem,
+                "PS2_Game",
+            )
+            final_enc = output_dir / f"{safe_stem}.ISO.BIN.ENC"
+            final_edat = output_dir / f"{safe_stem}.ISO.BIN.EDAT"
+            final_sfo = output_dir / f"{safe_stem}{self.ENCRYPT_SFO_SUFFIX}"
+            final_enc.unlink(missing_ok=True)
+
+
+            disc_id = (
+                self.detected_disc_id.get().strip()
+                or self.refresh_disc_id_cache()
+                or ""
+            )
+            title = (
+                self.game_title.get().strip()
+                or self.clean_title_from_path(source_path)
+            )
+            title_id = (
+                self.compact_disc_title_id(disc_id)
+                if disc_id
+                else ""
+            )
+            self.log(f"--- PS2 image encryption v{self.APP_VERSION} ---")
+            self.log(f"Source: {source_path}")
+            self.log(f"Target: {self.target_type.get()}")
+            self.log(f"ENC Content ID: {encryption_content_id}")
+            self.log(f"Output: {final_enc}")
+
+            self.set_progress(15)
+            self.run_command(
+                [
+                    ps2classic,
+                    "e",
+                    target,
+                    key_path,
+                    encrypt_input,
+                    final_enc,
+                    "ISO.BIN.ENC",
+                    encryption_content_id,
+                ],
+                self.script_dir,
+                stage="Encrypting PS2 image to ISO.BIN.ENC",
+            )
+
+            if not final_enc.is_file() or final_enc.stat().st_size == 0:
+                raise RuntimeError("ISO.BIN.ENC was not created correctly.")
+
+            rap_output = None
+            placeholder_rap = self.find_placeholder_rap()
+
+            if self.encrypt_only_create_edat.get():
+                make_npdata = self.find_make_npdata()
+                if not make_npdata or not placeholder_rap or not disc_id:
+                    raise RuntimeError(
+                        "ISO.BIN.EDAT creation requires a detected disc ID, "
+                        "make_npdata.exe and the matching placeholder RAP."
+                    )
+
+                usrdir = work_dir / "USRDIR"
+                created_edat, _game_id, _info = self.create_iso_bin_edat(
+                    make_npdata=make_npdata,
+                    rap_path=placeholder_rap,
+                    disc_id=disc_id,
+                    content_id=encryption_content_id,
+                    klic_bin_path=klic_bin_path,
+                    usrdir=usrdir,
+                    work_dir=work_dir,
+                )
+                final_edat.unlink(missing_ok=True)
+                shutil.copy2(created_edat, final_edat)
+                self.log(f"ISO.BIN.EDAT sidecar created: {final_edat}")
+
+            if self.encrypt_only_copy_rap.get():
+                if not placeholder_rap:
+                    raise RuntimeError(
+                        "The matching placeholder RAP could not be found."
+                    )
+                exdata_output = output_dir / "exdata"
+                exdata_output.mkdir(exist_ok=True)
+                rap_output = exdata_output / f"{encryption_content_id}.rap"
+                shutil.copy2(placeholder_rap, rap_output)
+                self.log(f"RAP copied: {rap_output}")
+
+            if not title_id:
+                raise RuntimeError(
+                    "A valid PS2 Title ID is required to create the companion PARAM.SFO."
+                )
+            self.create_encrypted_companion_sfo(
+                final_sfo,
+                title=title,
+                title_id=title_id,
+                image_type=self.image_type.get(),
+            )
+            self.log(f"Companion PARAM.SFO created: {final_sfo}")
+
+            generated_vme = None
+            if self.encrypt_vmc.get():
+                vmc = Path(self.vmc_path.get().strip())
+                if not vmc.is_file():
+                    raise RuntimeError("The selected VMC file does not exist.")
+                generated_vme = output_dir / (vmc.stem + ".VME")
+                vmc_command = [
+                    ps2classic,
+                    "ve",
+                    target,
+                    vmc,
+                    generated_vme,
+                ]
+                eid_key = self.eid_root_key_path.get().strip()
+                if eid_key:
+                    vmc_command.append(Path(eid_key))
+                self.run_command(
+                    vmc_command,
+                    self.script_dir,
+                    stage="Encrypting VMC to VME",
+                )
+                if not generated_vme.is_file():
+                    raise RuntimeError("The VME file was not created.")
+                self.log(f"VME created: {generated_vme}")
+
+            self.set_progress(90)
+            digest = self.sha256_file(final_enc)
+            self.set_progress(100)
+            self.set_status("Encryption completed successfully")
+            self.log(
+                f"ISO.BIN.ENC created: {final_enc} · SHA-256 {digest}"
+            )
+
+            message_lines = [
+                "Encryption completed successfully.",
+                "",
+                f"ISO.BIN.ENC:\n{final_enc}",
+            ]
+            if self.encrypt_only_create_edat.get():
+                message_lines.extend(["", f"ISO.BIN.EDAT:\n{final_edat}"])
+            message_lines.extend(["", f"PARAM.SFO:\n{final_sfo}"])
+            if rap_output:
+                message_lines.extend(["", f"RAP:\n{rap_output}"])
+            if generated_vme:
+                message_lines.extend(["", f"VME:\n{generated_vme}"])
+
+            messagebox.showinfo(
+                "Encryption completed",
+                "\n".join(message_lines),
+                parent=self.root,
+            )
+        except Exception as error:
+            self.end_busy()
+            self.set_status("Encryption failed")
+            self.log(f"ERROR: {error}")
+            messagebox.showerror(
+                "Encryption failed",
+                str(error),
+                parent=self.root,
+            )
+        finally:
+            if work_dir and work_dir.exists():
+                try:
+                    shutil.rmtree(work_dir)
+                except Exception as cleanup_error:
+                    self.log(
+                        "The temporary encryption folder could not be removed: "
+                        f"{cleanup_error}"
+                    )
+            self.building = False
+            self.update_build_readiness()
+
     def build_pkg(self):
+        if self.input_mode.get() == "encrypt_only":
+            self.encrypt_iso_only()
+            return
+
         # Populate only missing metadata. User edits remain untouched.
         if not all(
             (
@@ -6003,12 +8558,11 @@ class PS2ClassicsGUIMod:
             if self.create_project_ps2_key.get():
                 self.write_project_ps2_key(build_key_bytes)
 
-            source_mode = self.input_mode.get()
-            encrypted_mode = source_mode == "encrypted"
+            source_path = Path(self.iso_path.get().strip())
+            encrypted_mode = self.source_is_encrypted(source_path)
             individual_mode = (
                 not encrypted_mode and self.create_individual_edat.get()
             )
-            source_path = Path(self.iso_path.get().strip())
             output_dir = Path(self.output_dir.get().strip())
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6030,12 +8584,12 @@ class PS2ClassicsGUIMod:
 
             if not encrypted_mode and (not ps2classic or not disc_id):
                 raise RuntimeError(
-                    "Raw-image mode requires ps2classic.exe and a detected "
+                    "Raw source packaging requires ps2classic.exe and a detected "
                     "PS2 disc ID."
                 )
             if not encrypted_mode and not make_npdata:
                 raise RuntimeError(
-                    "Raw-image mode requires make_npdata.exe to create "
+                    "Raw source packaging requires make_npdata.exe to create "
                     "a fresh ISO.BIN.EDAT for the selected game."
                 )
 
@@ -6125,6 +8679,22 @@ class PS2ClassicsGUIMod:
                     f"{source if source else 'omitted'}"
                 )
 
+            snd0_source = None
+            snd0_text = self.snd0_path.get().strip()
+            if snd0_text:
+                snd0_candidate = Path(snd0_text)
+                if not snd0_candidate.is_file():
+                    raise RuntimeError(
+                        f"SND0.AT3 source no longer exists: {snd0_candidate}"
+                    )
+                if snd0_candidate.stat().st_size == 0:
+                    raise RuntimeError("The selected SND0.AT3 is empty.")
+                snd0_source = snd0_candidate.resolve()
+            self.log(
+                "Build asset SND0.AT3: "
+                + (str(snd0_source) if snd0_source else "omitted")
+            )
+
             self.title_id.set(package_title_id)
             param_sfo = package_dir / "PARAM.SFO"
             self.patch_param_sfo(
@@ -6132,8 +8702,6 @@ class PS2ClassicsGUIMod:
                 {
                     "TITLE": self.game_title.get().strip(),
                     "TITLE_ID": package_title_id,
-                    "APP_VER": version,
-                    "VERSION": version,
                 },
             )
 
@@ -6295,15 +8863,17 @@ class PS2ClassicsGUIMod:
                 (package_dir / "PIC0.PNG").unlink(missing_ok=True)
                 self.log("PIC0.PNG omitted by user choice.")
 
-            snd0_text = self.snd0_path.get().strip()
-            if snd0_text:
-                if self.copy_optional(
-                    snd0_text,
-                    package_dir / "SND0.AT3",
-                ):
-                    self.log("SND0.AT3 copied.")
+            snd0_target = package_dir / "SND0.AT3"
+            snd0_target.unlink(missing_ok=True)
+            if snd0_source:
+                shutil.copy2(snd0_source, snd0_target)
+                if not snd0_target.is_file() or snd0_target.stat().st_size == 0:
+                    raise RuntimeError("SND0.AT3 was not copied correctly.")
+                self.log(
+                    f"SND0.AT3 copied: {snd0_target.stat().st_size} bytes."
+                )
             else:
-                (package_dir / "SND0.AT3").unlink(missing_ok=True)
+                self.log("SND0.AT3 omitted by user choice.")
 
             # CONFIG is optional. Existing encrypted CONFIG files can be copied
             # even in package-only mode. Raw CONFIG files require ps2classic.
@@ -6460,7 +9030,7 @@ class PS2ClassicsGUIMod:
                     if rap_output.exists():
                         rap_output.unlink()
                     shutil.copy2(rap_path, rap_output)
-                    self.log(f"RAP license copied: {rap_output}")
+                    self.log(f"RAP copied: {rap_output}")
 
                 self.log(
                     "Encrypted build artifacts were kept in the output folder."

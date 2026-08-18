@@ -20,15 +20,12 @@ the user.
 ## Features
 
 - Live XMB-style preview with clickable ICON0, PIC0, PIC1 and game-title areas.
+- Optional SND0.AT3 audio preview. The app can use a local FFmpeg/ffplay installation or a separately downloaded MiniPlayer.exe from AT9-AT3_Converter.
 - Automatic ICON0, PIC0 and PIC1 normalization from JPG/PNG sources. Images keep their aspect ratio, are centered on transparent 320x176, 1000x560 and 1920x1080 canvases.
-- Automatic metadata, ID and image-type detection for DVD/CD.
+- Automatic metadata, ID and image-type detection
 - Automatic CONFIG lookup and insertion by ID.
-- **Update Configs** downloads the current CONFIG archive into the existing local `CONFIGS` folder.
+- **Update Configs** downloads the current webMAN-MOD CONFIG archive into the existing local `CONFIGS` folder
 - **Re-scan Configs** checks the selected game again after an update or local CONFIG change.
-- Local PS2 Classics compatibility cache with expandable compatibility notes.
-- Optional title-map refresh for improved ID to title matching.
-- Automatic detection and restoration/generation of required local files.
-- Collapsible build-readiness panel showing missing requirements.
 - Options for retaining build artifacts for inspection.
 - Extended post-build verification.
 - Collapsible process-log section.
@@ -65,9 +62,22 @@ py -3 -m pip install --upgrade Pillow PyInstaller
    - `app.ico` (for .exe build)
    - `app.png` (for .exe build)
    - `comp_cache.db` (compatibility check)
+   - `player/MiniPlayer.exe` (optional SND0.AT3 preview player; can also be downloaded from the app)
 
 The mod automatically detects and reuses the locally installed tools,
 templates, CONFIG files, covers and so on...
+
+## Optional AT3 preview player
+
+SND0.AT3 preview playback is optional. The application first checks for a local
+`player\MiniPlayer.exe`, then for `ffplay`/`ffmpeg`. If no compatible player is
+available, the XMB preview shows an optional **Download player** button.
+
+That button downloads `MiniPlayer.exe` directly from the public
+[BenMitnicK/AT9-AT3_Converter](https://github.com/BenMitnicK/AT9-AT3_Converter)
+repository into the local `root/player` folder. MiniPlayer is third-party software
+and is **not bundled or redistributed by this repository**. Its own upstream
+license, notices and requirements apply.
 
 ## How to run
 
@@ -102,8 +112,6 @@ Copy the generated EXE from `_build` into the root of
 `ps2classics_GUI_2.2.3` before using it normally.
 
 The original toolchain remains external and must still be present in the same installation.
-
-## Legal notice
 
 ## Legal notice
 
